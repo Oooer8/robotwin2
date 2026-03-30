@@ -135,10 +135,14 @@ def load_task_instructions(task_name: str) -> Dict[str, Any]:
         task_data = json.load(f)
     return task_data
 
+def resolve_save_root(scene_info_path: str) -> str:
+    if os.path.isabs(scene_info_path):
+        return os.path.normpath(scene_info_path)
+    return os.path.normpath(os.path.join(parent_directory, "..", "..", scene_info_path))
 
 def load_scene_info(task_name: str, setting: str, scene_info_path: str) -> Dict[str, Dict]:
-    """Load the scene info from the JSON file in the data directory."""
-    file_path = os.path.join(parent_directory, f"../../{scene_info_path}/{task_name}/{setting}/scene_info.json")
+    save_root = resolve_save_root(scene_info_path)
+    file_path = os.path.join(save_root, task_name, setting, "scene_info.json")
     try:
         with open(file_path, "r") as f:
             scene_data = json.load(f)
@@ -146,9 +150,7 @@ def load_scene_info(task_name: str, setting: str, scene_info_path: str) -> Dict[
     except FileNotFoundError:
         print(f"\033[1mERROR: Scene info file '{file_path}' not found.\033[0m")
         exit(1)
-    except json.JSONDecodeError:
-        print(f"\033[1mERROR: Scene info file '{file_path}' contains invalid JSON.\033[0m")
-        exit(1)
+
 
 
 def extract_episodes_from_scene_info(scene_info: Dict) -> List[Dict[str, str]]:
@@ -162,15 +164,14 @@ def extract_episodes_from_scene_info(scene_info: Dict) -> List[Dict[str, str]]:
     return episodes
 
 
-def save_episode_descriptions(task_name: str, setting: str, generated_descriptions: List[Dict]):
-    """Save generated descriptions to output files."""
-    output_dir = os.path.join(parent_directory, f"../../data/{task_name}/{setting}/instructions")
+def save_episode_descriptions(task_name: str, setting: str, generated_descriptions: List[Dict], scene_info_path: str):
+    save_root = resolve_save_root(scene_info_path)
+    output_dir = os.path.join(save_root, task_name, setting, "instructions")
     os.makedirs(output_dir, exist_ok=True)
 
     for episode_desc in generated_descriptions:
         episode_index = episode_desc["episode_index"]
         output_file = os.path.join(output_dir, f"episode{episode_index}.json")
-
         with open(output_file, "w") as f:
             json.dump(
                 {
@@ -180,6 +181,7 @@ def save_episode_descriptions(task_name: str, setting: str, generated_descriptio
                 f,
                 indent=2,
             )
+
 
 def generate_episode_descriptions(task_name: str, episodes: List[Dict[str, str]], max_descriptions: int = 1000000):
     """
@@ -265,12 +267,12 @@ if __name__ == "__main__":
         args_dict = yaml.load(f.read(), Loader=yaml.FullLoader)
 
     # Load scene info and extract episode parameters
-    scene_info = load_scene_info(args.task_name, args.setting, args_dict['save_path'])
+    scene_info = load_scene_info(args.task_name, args.setting, args_dict["save_path"])
     episodes = extract_episodes_from_scene_info(scene_info)
 
     # Generate descriptions
     results = generate_episode_descriptions(args.task_name, episodes, args.max_num)
 
     # Save results to output files
-    save_episode_descriptions(args.task_name, args.setting, results)
+    save_episode_descriptions(args.task_name, args.setting, results, args_dict["save_path"])
     print("Successfully Saved Instructions")

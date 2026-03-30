@@ -62,6 +62,7 @@ class place_object_scale(Base_Task):
             model_id=self.selected_model_id,
         )
         self.object.set_mass(0.05)
+        self.arm_tag = ArmTag("right" if rand_pos.p[0] > 0 else "left")
 
         if rand_pos.p[0] > 0:
             xlim = [0.02, 0.25]
@@ -98,9 +99,6 @@ class place_object_scale(Base_Task):
         self.add_prohibit_area(self.scale, padding=0.05)
 
     def play_once(self):
-        # Determine which arm to use based on object's x position (right if positive, left if negative)
-        self.arm_tag = ArmTag("right" if self.object.get_pose().p[0] > 0 else "left")
-
         # Grasp the object with the selected arm
         self.move(self.grasp_actor(self.object, arm_tag=self.arm_tag))
 

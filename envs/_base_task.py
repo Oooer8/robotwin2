@@ -101,6 +101,9 @@ class Base_Task(gym.Env):
 
         self.save_freq = kwags.get("save_freq")
         self.world_pcd = None
+        self.store_real_joint_state = kwags.get("store_real_joint_state", False)
+        self.save_frame_limit = kwags.get("save_frame_limit", None)
+        self.enable_take_action_save = kwags.get("enable_take_action_save", False)
 
         self.size_dict = list()
         self.cluttered_objs = list()
@@ -129,6 +132,9 @@ class Base_Task(gym.Env):
 
         self.robot.set_origin_endpose()
         self.load_actors()
+        
+        self.allow_replay_exhaust_as_fail = kwags.get("allow_replay_exhaust_as_fail", False)
+        self.replay_exhausted = False
 
         if self.cluttered_table:
             self.get_cluttered_table()
@@ -146,6 +152,8 @@ class Base_Task(gym.Env):
                 except:
                     print(f"{self.task_name} not in step limit file, set to 1000")
                     self.step_lim = 1000
+            if self.save_data and self.save_frame_limit is None:
+                self.save_frame_limit = self.step_lim + 1 if self.enable_take_action_save else self.step_lim
 
         # info
         self.info = dict()
@@ -505,8 +513,37 @@ class Base_Task(gym.Env):
         rgb = self.cameras.get_rgb()
         save_img(save_path, rgb[camera_name]['rgb'])
 
+    def _pack_joint_state(self, left_jointstate, right_jointstate):
+        left_jointstate = np.asarray(left_jointstate, dtype=np.float32)
+        right_jointstate = np.asarray(right_jointstate, dtype=np.float32)
+        return {
+            "left_arm": left_jointstate[:-1],
+            "left_gripper": np.float32(left_jointstate[-1]),
+            "right_arm": right_jointstate[:-1],
+            "right_gripper": np.float32(right_jointstate[-1]),
+            "vector": np.concatenate([left_jointstate, right_jointstate]).astype(np.float32),
+        }
+
+    def _augment_obs_for_storage(self, obs):
+        if not self.store_real_joint_state:
+            return obs
+
+        if not self.data_type.get("qpos", False):
+            return obs
+
+        left_target = self.robot.get_left_arm_jointState()
+        right_target = self.robot.get_right_arm_jointState()
+        left_real = self.robot.get_left_arm_real_jointState()
+        right_real = self.robot.get_right_arm_real_jointState()
+
+        obs["joint_action"] = self._pack_joint_state(left_real, right_real)
+        obs["joint_target"] = self._pack_joint_state(left_target, right_target)
+        return obs
+
     def _take_picture(self):  # save data
         if not self.save_data:
+            return
+        if self.save_frame_limit is not None and self.FRAME_IDX >= int(self.save_frame_limit):
             return
 
         print("saving: episode = ", self.ep_num, " index = ", self.FRAME_IDX, end="\r")
@@ -521,6 +558,8 @@ class Base_Task(gym.Env):
                         os.remove(directory + file)
 
         pkl_dic = self.get_obs()
+        pkl_dic = self._augment_obs_for_storage(pkl_dic)
+        self.now_obs = deepcopy(pkl_dic)
         save_pkl(self.folder_path["cache"] + f"{self.FRAME_IDX}.pkl", pkl_dic)  # use cache
         self.FRAME_IDX += 1
 
@@ -571,6 +610,62 @@ class Base_Task(gym.Env):
         self.need_plan = args.get("need_plan", True)
         self.left_joint_path = args.get("left_joint_path", [])
         self.right_joint_path = args.get("right_joint_path", [])
+        self.left_cnt = 0
+        self.right_cnt = 0
+        self.replay_exhausted = False
+
+    def _build_replay_exhausted_result(self):
+        return {"status": "ReplayExhausted"}
+
+    def _is_replay_exhausted_result(self, result):
+        return isinstance(result, dict) and result.get("status") == "ReplayExhausted"
+
+    def _get_single_replay_result(self, arm_tag):
+        if arm_tag == "left":
+            joint_path = self.left_joint_path
+            idx = self.left_cnt
+            cnt_attr = "left_cnt"
+        elif arm_tag == "right":
+            joint_path = self.right_joint_path
+            idx = self.right_cnt
+            cnt_attr = "right_cnt"
+        else:
+            raise ValueError(f"Unknown arm_tag: {arm_tag}")
+
+        if idx >= len(joint_path):
+            if self.allow_replay_exhaust_as_fail:
+                self.replay_exhausted = True
+                return self._build_replay_exhausted_result()
+            raise IndexError(
+                f"{arm_tag} replay path exhausted: idx={idx}, len={len(joint_path)}, ep={self.ep_num}"
+            )
+
+        setattr(self, cnt_attr, idx + 1)
+        return deepcopy(joint_path[idx])
+
+    def _get_together_replay_result(self):
+        left_idx = self.left_cnt
+        right_idx = self.right_cnt
+
+        left_ok = left_idx < len(self.left_joint_path)
+        right_ok = right_idx < len(self.right_joint_path)
+
+        if not left_ok or not right_ok:
+            if self.allow_replay_exhaust_as_fail:
+                self.replay_exhausted = True
+                exhausted = self._build_replay_exhausted_result()
+                return exhausted, exhausted
+            raise IndexError(
+                "together replay path exhausted: "
+                f"left_idx={left_idx}, left_len={len(self.left_joint_path)}, "
+                f"right_idx={right_idx}, right_len={len(self.right_joint_path)}, ep={self.ep_num}"
+            )
+
+        left_result = deepcopy(self.left_joint_path[left_idx])
+        right_result = deepcopy(self.right_joint_path[right_idx])
+        self.left_cnt += 1
+        self.right_cnt += 1
+        return left_result, right_result
 
     def _set_eval_video_ffmpeg(self, ffmpeg):
         self.eval_video_ffmpeg = ffmpeg
@@ -749,8 +844,10 @@ class Base_Task(gym.Env):
             left_result = self.robot.left_plan_path(pose, constraint_pose=constraint_pose)
             self.left_joint_path.append(deepcopy(left_result))
         else:
-            left_result = deepcopy(self.left_joint_path[self.left_cnt])
-            self.left_cnt += 1
+            left_result = self._get_single_replay_result("left")
+
+        if self._is_replay_exhausted_result(left_result):
+            return
 
         if left_result["status"] != "Success":
             self.plan_success = False
@@ -782,8 +879,10 @@ class Base_Task(gym.Env):
             right_result = self.robot.right_plan_path(pose, constraint_pose=constraint_pose)
             self.right_joint_path.append(deepcopy(right_result))
         else:
-            right_result = deepcopy(self.right_joint_path[self.right_cnt])
-            self.right_cnt += 1
+            right_result = self._get_single_replay_result("right")
+
+        if self._is_replay_exhausted_result(right_result):
+            return
 
         if right_result["status"] != "Success":
             self.plan_success = False
@@ -821,10 +920,10 @@ class Base_Task(gym.Env):
             self.left_joint_path.append(deepcopy(left_result))
             self.right_joint_path.append(deepcopy(right_result))
         else:
-            left_result = deepcopy(self.left_joint_path[self.left_cnt])
-            right_result = deepcopy(self.right_joint_path[self.right_cnt])
-            self.left_cnt += 1
-            self.right_cnt += 1
+            left_result, right_result = self._get_together_replay_result()
+
+        if self._is_replay_exhausted_result(left_result) or self._is_replay_exhausted_result(right_result):
+            return
 
         try:
             left_success = left_result["status"] == "Success"
@@ -832,7 +931,7 @@ class Base_Task(gym.Env):
             if not left_success or not right_success:
                 self.plan_success = False
                 # return TODO
-        except Exception as e:
+        except Exception:
             if left_result is None or right_result is None:
                 self.plan_success = False
                 return  # TODO
@@ -905,7 +1004,7 @@ class Base_Task(gym.Env):
                 else:
                     return actions[1][1]
 
-        if self.plan_success is False:
+        if self.plan_success is False or self.replay_exhausted:
             return False
 
         actions = [actions_by_arm1, actions_by_arm2]
@@ -930,7 +1029,7 @@ class Base_Task(gym.Env):
                     left_constraint_pose=left.args.get("constraint_pose"),
                     right_constraint_pose=right.args.get("constraint_pose"),
                 )
-                if self.plan_success is False:
+                if self.plan_success is False or self.replay_exhausted:
                     return False
                 continue  # TODO
             else:
@@ -948,7 +1047,7 @@ class Base_Task(gym.Env):
                         )
                     else:  # left.action == 'gripper'
                         control_seq["left_gripper"] = self.set_gripper(left_pos=left.target_gripper_pos, set_tag="left")
-                    if self.plan_success is False:
+                    if self.plan_success is False or self.replay_exhausted:
                         return False
 
                 if right is not None:
@@ -960,7 +1059,7 @@ class Base_Task(gym.Env):
                     else:  # right.action == 'gripper'
                         control_seq["right_gripper"] = self.set_gripper(right_pos=right.target_gripper_pos,
                                                                         set_tag="right")
-                    if self.plan_success is False:
+                    if self.plan_success is False or self.replay_exhausted:
                         return False
 
             self.take_dense_action(control_seq)
@@ -1481,6 +1580,7 @@ class Base_Task(gym.Env):
             return
 
         eval_video_freq = 1  # fixed
+        save_frame_on_action_boundary = self.save_data and self.enable_take_action_save
         if (self.eval_video_path is not None and self.take_action_cnt % eval_video_freq == 0):
             self.eval_video_ffmpeg.stdin.write(self.now_obs["observation"]["head_camera"]["rgb"].tobytes())
 
@@ -1626,6 +1726,9 @@ class Base_Task(gym.Env):
 
         now_left_id, now_right_id = 0, 0
 
+        if save_frame_on_action_boundary and self.FRAME_IDX == 0:
+            self._take_picture()
+
         # ========== Control Loop ==========
         while now_left_id < left_n_step or now_right_id < right_n_step:
 
@@ -1657,11 +1760,15 @@ class Base_Task(gym.Env):
             if self.check_success():
                 self.eval_success = True
                 self.get_obs() # update obs
+                if save_frame_on_action_boundary:
+                    self._take_picture()
                 if (self.eval_video_path is not None):
                     self.eval_video_ffmpeg.stdin.write(self.now_obs["observation"]["head_camera"]["rgb"].tobytes())
                 return
 
         self._update_render()
+        if save_frame_on_action_boundary:
+            self._take_picture()
         if self.render_freq:  # UI
             self.viewer.render()
 

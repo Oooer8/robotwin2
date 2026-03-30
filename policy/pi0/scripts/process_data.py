@@ -1,12 +1,32 @@
-import sys
-
 import os
 import h5py
 import numpy as np
-import pickle
 import cv2
 import argparse
+from pathlib import Path
 import yaml, json
+
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+def resolve_project_path(path_str):
+    path = Path(path_str)
+    if path.is_absolute():
+        return path
+    return (REPO_ROOT / path).resolve()
+
+
+def infer_collection_dir(task_name, task_config):
+    task_cfg_path = REPO_ROOT / "task_config" / f"{task_config}.yml"
+    if not task_cfg_path.exists():
+        raise FileNotFoundError(f"Task config not found: {task_cfg_path}")
+
+    with open(task_cfg_path, "r", encoding="utf-8") as f:
+        task_cfg = yaml.safe_load(f)
+
+    save_path = task_cfg.get("save_path", "./data")
+    return resolve_project_path(save_path) / task_name / task_config
 
 
 def load_hdf5(dataset_path):
@@ -43,12 +63,6 @@ def images_encoding(imgs):
     for i in range(len(imgs)):
         padded_data.append(encode_data[i].ljust(max_len, b"\0"))
     return encode_data, max_len
-
-
-def get_task_config(task_name):
-    with open(f"./task_config/{task_name}.yml", "r", encoding="utf-8") as f:
-        args = yaml.load(f.read(), Loader=yaml.FullLoader)
-    return args
 
 
 def data_transform(path, episode_num, save_path):
@@ -167,14 +181,14 @@ if __name__ == "__main__":
     setting = args.setting
     expert_data_num = args.expert_data_num
 
-    load_dir = os.path.join("../../data", str(task_name), str(setting))
+    load_dir = infer_collection_dir(task_name, setting)
 
     begin = 0
-    print(f'read data from path:{os.path.join("data", load_dir)}')
+    print(f"read data from path: {load_dir}")
 
     target_dir = f"processed_data/{task_name}-{setting}-{expert_data_num}"
     begin = data_transform(
-        load_dir,
+        str(load_dir),
         expert_data_num,
         target_dir,
     )

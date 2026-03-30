@@ -28,3 +28,7 @@ envs/curobo/*
 
 /*.json*
 /*.txt
+
+logs
+processed_data
+training_data
