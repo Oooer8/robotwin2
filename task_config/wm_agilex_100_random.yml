@@ -1,0 +1,57 @@
+# if you want to modify the config, please check the following tutorial first:
+# https://robotwin-platform.github.io/doc/usage/configurations.html
+render_freq: 0
+episode_num: 110
+use_seed: false
+save_freq: 15
+# start_seed: 1000
+embodiment: [aloha-agilex]
+language_num: 100
+random_action:
+  step_limit: 100
+  left_xyz_min: [-0.16, -0.18, 0.82]
+  left_xyz_max: [0.25, 0.18, 1.08]
+  right_xyz_min: [-0.25, -0.18, 0.82]
+  right_xyz_max: [0.16, 0.18, 1.08]
+  random_orientation: true
+  orientation_mode: delta
+  delta_roll_range: [-0.35, 0.35]
+  delta_pitch_range: [-0.45, 0.45]
+  delta_yaw_range: [-1.2, 1.2]
+  center_bias_prob: 0.6
+  center_box_scale: 0.7
+  joint_delta_low: -0.25
+  joint_delta_high: 0.25
+  joint_clip: 3.1415926
+  gripper_hold_prob: 0.7
+  gripper_open_prob: 0.15
+  gripper_close_prob: 0.15
+domain_randomization:
+  random_background: true
+  cluttered_table: true
+  clean_background_rate: 0.02
+  random_head_camera_dis: 0
+  random_table_height: 0
+  random_light: true
+  crazy_random_light_rate: 0.02
+camera:
+  head_camera_type: D435
+  wrist_camera_type: D435
+  collect_head_camera: true
+  collect_wrist_camera: true
+data_type:
+  rgb: true
+  third_view: false
+  depth: false
+  pointcloud: false
+  observer: false
+  endpose: true
+  qpos: true
+  mesh_segmentation: false
+  actor_segmentation: false
+pcd_down_sample_num: 1024
+pcd_crop: true
+save_path: /mnt/damoxing/dataset_file/robotwin/agilex_random
+clear_cache_freq: 5
+collect_data: true
+eval_video_log: true
