@@ -32,6 +32,9 @@ class ReplayConfig:
     embodiment_dis: float | None
     replay_camera_type: str
     replay_camera_cfg: dict[str, Any]
+    head_camera_type: str
+    head_camera_cfg: dict[str, Any]
+    head_camera_static_info: dict[str, Any] | None
 
 
 class FfmpegVideoWriter:
@@ -132,6 +135,14 @@ def build_replay_config(task_name: str, task_config_name: str, collection_suffix
     replay_camera_cfg.setdefault("near", 0.1)
     replay_camera_cfg.setdefault("far", 100.0)
 
+    head_camera_type = task_cfg["camera"]["head_camera_type"]
+    if head_camera_type not in camera_types:
+        raise KeyError(f"Unknown head camera type for replay: {head_camera_type}")
+
+    head_camera_cfg = dict(camera_types[head_camera_type])
+    head_camera_cfg.setdefault("near", 0.1)
+    head_camera_cfg.setdefault("far", 100.0)
+
     if len(embodiment) == 1:
         left_robot_file = get_embodiment_file(embodiment[0], embodiment_types)
         right_robot_file = get_embodiment_file(embodiment[0], embodiment_types)
@@ -147,6 +158,14 @@ def build_replay_config(task_name: str, task_config_name: str, collection_suffix
 
     left_embodiment_config = load_yaml(left_robot_file / "config.yml")
     right_embodiment_config = load_yaml(right_robot_file / "config.yml")
+    head_camera_static_info = next(
+        (
+            dict(camera_info)
+            for camera_info in left_embodiment_config.get("static_camera_list", [])
+            if camera_info.get("name") == "head_camera"
+        ),
+        None,
+    )
 
     return ReplayConfig(
         task_name=task_name,
@@ -160,6 +179,9 @@ def build_replay_config(task_name: str, task_config_name: str, collection_suffix
         embodiment_dis=embodiment_dis,
         replay_camera_type=replay_camera_type,
         replay_camera_cfg=replay_camera_cfg,
+        head_camera_type=head_camera_type,
+        head_camera_cfg=head_camera_cfg,
+        head_camera_static_info=head_camera_static_info,
     )
 
 
@@ -212,6 +234,28 @@ def load_episode_states(hdf5_path: Path) -> tuple[np.ndarray, int, int]:
         raise ValueError(f"Episode {hdf5_path} does not contain valid joint states")
 
     return states.astype(np.float64), int(left_arm.shape[1]), int(right_arm.shape[1])
+
+
+def load_head_camera_pose_from_hdf5(hdf5_path: Path) -> np.ndarray | None:
+    import h5py
+
+    with h5py.File(hdf5_path, "r") as root:
+        dataset_path = "/observation/head_camera/cam2world_gl"
+        if dataset_path not in root:
+            return None
+
+        cam2world = root[dataset_path][()]
+
+    cam2world = np.asarray(cam2world, dtype=np.float64)
+    if cam2world.shape == (4, 4):
+        return cam2world
+    if cam2world.ndim == 3 and cam2world.shape[1:] == (4, 4):
+        if cam2world.shape[0] == 0:
+            return None
+        return cam2world[0]
+    raise ValueError(
+        f"Unexpected head camera pose shape in {hdf5_path}: {cam2world.shape}, expected (4, 4) or (T, 4, 4)"
+    )
 
 
 def create_scene() -> tuple[Any, Any, Any]:
@@ -357,6 +401,22 @@ def pose_from_axes(position: np.ndarray, forward: np.ndarray, left: np.ndarray) 
     return sapien.Pose(mat44)
 
 
+def build_pose_matrix(position: np.ndarray, forward: np.ndarray, left: np.ndarray) -> np.ndarray:
+    position = np.asarray(position, dtype=np.float64)
+    forward = np.asarray(forward, dtype=np.float64)
+    left = np.asarray(left, dtype=np.float64)
+
+    forward = forward / np.linalg.norm(forward)
+    left = left / np.linalg.norm(left)
+    up = np.cross(forward, left)
+    up = up / np.linalg.norm(up)
+
+    mat44 = np.eye(4)
+    mat44[:3, :3] = np.stack([forward, left, up], axis=1)
+    mat44[:3, 3] = position
+    return mat44
+
+
 def target_up_to_axes(position: np.ndarray, target: np.ndarray, up_hint: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     position = np.asarray(position, dtype=np.float64)
     target = np.asarray(target, dtype=np.float64)
@@ -439,6 +499,48 @@ def create_render_cameras(
     return cameras
 
 
+def create_pose_camera(
+    scene: Any,
+    name: str,
+    pose_matrix: np.ndarray,
+    camera_cfg: dict[str, Any],
+) -> Any:
+    import sapien.core as sapien
+
+    width = int(camera_cfg["w"])
+    height = int(camera_cfg["h"])
+    fovy = np.deg2rad(float(camera_cfg["fovy"]))
+    near = float(camera_cfg.get("near", 0.1))
+    far = float(camera_cfg.get("far", 100.0))
+
+    camera = scene.add_camera(
+        name=name,
+        width=width,
+        height=height,
+        fovy=fovy,
+        near=near,
+        far=far,
+    )
+    camera.entity.set_pose(sapien.Pose(np.asarray(pose_matrix, dtype=np.float64)))
+    return camera
+
+
+def get_fallback_head_camera_pose(replay_cfg: ReplayConfig) -> np.ndarray | None:
+    camera_info = replay_cfg.head_camera_static_info
+    if camera_info is None:
+        return None
+
+    position = np.asarray(camera_info["position"], dtype=np.float64)
+    forward = camera_info.get("forward")
+    if forward is None:
+        forward = (-1.0 * position).tolist()
+    left = camera_info.get("left")
+    if left is None:
+        left = [-forward[1], forward[0], 0.0]
+
+    return build_pose_matrix(position, np.asarray(forward, dtype=np.float64), np.asarray(left, dtype=np.float64))
+
+
 def render_camera_rgb(camera: Any) -> np.ndarray:
     camera.take_picture()
     rgba = camera.get_picture("Color")
@@ -464,7 +566,7 @@ def replay_episode(
 
     episode_idx = int(hdf5_path.stem.replace("episode", ""))
     output_dir = build_output_dir(replay_cfg.collection_dir, episode_idx)
-    view_paths = {view: output_dir / f"{view}.mp4" for view in ("front", "side", "top")}
+    view_paths = {view: output_dir / f"{view}.mp4" for view in ("front", "side", "top", "head")}
     manifest_path = output_dir / "manifest.json"
 
     if not overwrite and all(path.exists() for path in view_paths.values()) and manifest_path.exists():
@@ -494,10 +596,33 @@ def replay_episode(
 
     camera_setup = estimate_camera_setup(robot, distance_scale)
     cameras = create_render_cameras(scene, camera_setup, replay_cfg.replay_camera_cfg)
+    head_camera_pose = load_head_camera_pose_from_hdf5(hdf5_path)
+    head_camera_pose_source = "hdf5_observation.head_camera.cam2world_gl"
+    if head_camera_pose is None:
+        head_camera_pose = get_fallback_head_camera_pose(replay_cfg)
+        head_camera_pose_source = "embodiment_static_camera_list"
+    if head_camera_pose is None:
+        raise ValueError(
+            f"Unable to resolve head camera pose for {hdf5_path}: "
+            "missing /observation/head_camera/cam2world_gl and no head_camera in embodiment static_camera_list"
+        )
+    cameras["head"] = create_pose_camera(
+        scene,
+        name="robot_only_head",
+        pose_matrix=head_camera_pose,
+        camera_cfg=replay_cfg.head_camera_cfg,
+    )
 
-    video_width = int(replay_cfg.replay_camera_cfg["w"])
-    video_height = int(replay_cfg.replay_camera_cfg["h"])
-    writers = {view: FfmpegVideoWriter(path, video_width, video_height, fps) for view, path in view_paths.items()}
+    view_camera_cfgs = {
+        "front": replay_cfg.replay_camera_cfg,
+        "side": replay_cfg.replay_camera_cfg,
+        "top": replay_cfg.replay_camera_cfg,
+        "head": replay_cfg.head_camera_cfg,
+    }
+    writers = {
+        view: FfmpegVideoWriter(path, int(view_camera_cfgs[view]["w"]), int(view_camera_cfgs[view]["h"]), fps)
+        for view, path in view_paths.items()
+    }
 
     try:
         for state in states:
@@ -533,6 +658,14 @@ def replay_episode(
             "near": float(replay_cfg.replay_camera_cfg.get("near", 0.1)),
             "far": float(replay_cfg.replay_camera_cfg.get("far", 100.0)),
         },
+        "head_camera_model": {
+            "type": replay_cfg.head_camera_type,
+            "width": int(replay_cfg.head_camera_cfg["w"]),
+            "height": int(replay_cfg.head_camera_cfg["h"]),
+            "fovy_deg": float(replay_cfg.head_camera_cfg["fovy"]),
+            "near": float(replay_cfg.head_camera_cfg.get("near", 0.1)),
+            "far": float(replay_cfg.head_camera_cfg.get("far", 100.0)),
+        },
         "views": {view: str(path.resolve()) for view, path in view_paths.items()},
         "camera_setup": {
             view: {
@@ -540,6 +673,8 @@ def replay_episode(
             }
             for view, spec in camera_setup.items()
         },
+        "head_camera_pose_source": head_camera_pose_source,
+        "head_camera_pose": head_camera_pose.tolist(),
     }
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)

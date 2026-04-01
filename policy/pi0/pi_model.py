@@ -24,23 +24,56 @@ from openpi.training import config as _config
 from openpi.training import data_loader as _data_loader
 
 import os
+from pathlib import Path
 
 class PI0:
+
+    @staticmethod
+    def _list_dir_names(path):
+        if not path.exists() or not path.is_dir():
+            return []
+        return sorted(entry.name for entry in path.iterdir() if entry.is_dir())
 
     def __init__(self, train_config_name, model_name, checkpoint_id, pi0_step):
         self.train_config_name = train_config_name
         self.model_name = model_name
-        self.checkpoint_id = checkpoint_id
+        self.checkpoint_id = str(checkpoint_id)
 
         config = _config.get_config(self.train_config_name)
 
-        specified_path = f"policy/pi0/checkpoints/{self.train_config_name}/{self.model_name}/{self.checkpoint_id}/assets/"
-        entries = os.listdir(specified_path)
-        assets_id = entries[0]
+        checkpoint_dir = (
+            Path(__file__).resolve().parent
+            / "checkpoints"
+            / self.train_config_name
+            / self.model_name
+            / self.checkpoint_id
+        )
+        if not checkpoint_dir.is_dir():
+            available_checkpoints = self._list_dir_names(checkpoint_dir.parent)
+            raise FileNotFoundError(
+                f"Checkpoint directory not found: {checkpoint_dir}. "
+                f"Requested checkpoint_id={self.checkpoint_id}. "
+                f"Available checkpoints: {available_checkpoints or '[]'}"
+            )
+
+        assets_dir = checkpoint_dir / "assets"
+        if not assets_dir.is_dir():
+            raise FileNotFoundError(
+                f"Assets directory not found: {assets_dir}. "
+                f"Checkpoint exists, but assets are missing."
+            )
+
+        asset_ids = self._list_dir_names(assets_dir)
+        if not asset_ids:
+            raise FileNotFoundError(
+                f"No asset entries found under: {assets_dir}"
+            )
+
+        assets_id = asset_ids[0]
 
         self.policy = _policy_config.create_trained_policy(
             config,
-            f"policy/pi0/checkpoints/{self.train_config_name}/{self.model_name}/{self.checkpoint_id}",
+            str(checkpoint_dir),
             robotwin_repo_id=assets_id)
         print("loading model success!")
         self.img_size = (224, 224)
