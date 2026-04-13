@@ -8,7 +8,7 @@ python convert_dataset.py \
 
 python convert_dataset.py \
     /root/workspace/robotwin_data \
-    --output /root/workspace/robotwin_data/robotwin2_gtc_agilex_pi0 \
+    --output /root/workspace/robotwin_data/robotwin2_gtc_agilex_pi0_3 \
     --variant wm_agilex_100
 
 python convert_dataset.py \
@@ -179,7 +179,7 @@ def find_data_dir(task_dir: Path, variant: str | None = None) -> Path | None:
 
 
 def process(robotwin_root: Path, output_root: Path, variant: str | None = None):
-    agilex_root = robotwin_root / "agilex"
+    agilex_root = robotwin_root / "agilex_old"
     if not agilex_root.exists():
         raise FileNotFoundError(f"找不到 agilex 目录: {agilex_root}")
 

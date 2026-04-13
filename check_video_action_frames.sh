@@ -10,7 +10,7 @@
 set -uo pipefail
 
 # BASE_DIR="${HOME}/workspace/final/dataset/robotwin2_gtc_agilex_5k_random"
-BASE_DIR="/root/workspace/final/dataset/robotwin2_gtc_agilex_5k_fail_eval"
+BASE_DIR="/root/workspace/robotwin_data/robotwin2_gtc_agilex_pi0_3"
 
 ACTION_DIR="${BASE_DIR}/action"
 VIDEO_HEAD_DIR="${BASE_DIR}/videos/head"
