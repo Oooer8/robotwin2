@@ -11,7 +11,9 @@ CAMERA_VIDEO_SUFFIXES = {
 
 
 def load_images_to_video():
-    sys.path.append(str(Path(__file__).resolve().parent / "envs" / "utils"))
+    utils_path = str(Path(__file__).resolve().parent / "envs" / "utils")
+    if utils_path not in sys.path:
+        sys.path.append(utils_path)
     from images_to_video import images_to_video
 
     return images_to_video
@@ -51,7 +53,7 @@ def find_hdf5_files(path):
     if data_dir.is_dir():
         return sorted(data_dir.glob("episode*.hdf5"))
 
-    return []
+    return sorted(path.rglob("episode*.hdf5"))
 
 
 def default_video_dir(hdf5_path):
@@ -91,7 +93,10 @@ def export_videos(hdf5_path, output_dir, cameras, fps, overwrite):
 
 def main():
     parser = argparse.ArgumentParser(description="Export RoboTwin camera mp4 videos from episode*.hdf5 files.")
-    parser.add_argument("path", help="A single episode*.hdf5 file, a data directory, or a collection directory.")
+    parser.add_argument(
+        "path",
+        help="A single episode*.hdf5 file, a data directory, a collection directory, or a dataset root.",
+    )
     parser.add_argument("--output-dir", default=None, help="Directory for exported videos. Defaults to sibling video/ dir.")
     parser.add_argument(
         "--cameras",
@@ -107,6 +112,7 @@ def main():
     if not hdf5_files:
         raise FileNotFoundError(f"No episode*.hdf5 files found under {args.path}")
 
+    print(f"Found {len(hdf5_files)} episode hdf5 files under {args.path}")
     for hdf5_path in hdf5_files:
         export_videos(hdf5_path, args.output_dir, args.cameras, args.fps, args.overwrite)
 
