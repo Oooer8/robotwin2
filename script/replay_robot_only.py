@@ -236,28 +236,6 @@ def load_episode_states(hdf5_path: Path) -> tuple[np.ndarray, int, int]:
     return states.astype(np.float64), int(left_arm.shape[1]), int(right_arm.shape[1])
 
 
-def load_head_camera_pose_from_hdf5(hdf5_path: Path) -> np.ndarray | None:
-    import h5py
-
-    with h5py.File(hdf5_path, "r") as root:
-        dataset_path = "/observation/head_camera/cam2world_gl"
-        if dataset_path not in root:
-            return None
-
-        cam2world = root[dataset_path][()]
-
-    cam2world = np.asarray(cam2world, dtype=np.float64)
-    if cam2world.shape == (4, 4):
-        return cam2world
-    if cam2world.ndim == 3 and cam2world.shape[1:] == (4, 4):
-        if cam2world.shape[0] == 0:
-            return None
-        return cam2world[0]
-    raise ValueError(
-        f"Unexpected head camera pose shape in {hdf5_path}: {cam2world.shape}, expected (4, 4) or (T, 4, 4)"
-    )
-
-
 def create_scene() -> tuple[Any, Any, Any]:
     import sapien.core as sapien
     from sapien.render import set_global_config
@@ -525,7 +503,7 @@ def create_pose_camera(
     return camera
 
 
-def get_fallback_head_camera_pose(replay_cfg: ReplayConfig) -> np.ndarray | None:
+def get_collect_data_head_camera_pose(replay_cfg: ReplayConfig) -> np.ndarray | None:
     camera_info = replay_cfg.head_camera_static_info
     if camera_info is None:
         return None
@@ -596,15 +574,12 @@ def replay_episode(
 
     camera_setup = estimate_camera_setup(robot, distance_scale)
     cameras = create_render_cameras(scene, camera_setup, replay_cfg.replay_camera_cfg)
-    head_camera_pose = load_head_camera_pose_from_hdf5(hdf5_path)
-    head_camera_pose_source = "hdf5_observation.head_camera.cam2world_gl"
-    if head_camera_pose is None:
-        head_camera_pose = get_fallback_head_camera_pose(replay_cfg)
-        head_camera_pose_source = "embodiment_static_camera_list"
+    head_camera_pose = get_collect_data_head_camera_pose(replay_cfg)
+    head_camera_pose_source = "embodiment_static_camera_list"
     if head_camera_pose is None:
         raise ValueError(
             f"Unable to resolve head camera pose for {hdf5_path}: "
-            "missing /observation/head_camera/cam2world_gl and no head_camera in embodiment static_camera_list"
+            "missing head_camera in embodiment static_camera_list"
         )
     cameras["head"] = create_pose_camera(
         scene,
