@@ -1,205 +1,155 @@
 #!/bin/bash
 # ============================================================
 # replay_robot_only.sh
-# 要先修改task config，确保路径正确
-# 确保start seed注释掉
-# 用法: bash replay_robot_only.sh [task_config] [num_gpus]
-
-# 读 wm_agilex_100_fail 文件夹，但用 wm_agilex_100.yml 的配置
-# bash replay_robot_only.sh wm_agilex_100 8 wm_agilex_100_fail
-# 不传第三个参数，行为与原来完全一致（读 wm_agilex_100 文件夹）
-# bash replay_robot_only.sh wm_agilex_100 8
-CUDA_VISIBLE_DEVICES=2 python script/replay_robot_only.py \
-  --task-name place_dual_shoes \
-  --task-config wm_agilex_100 \
-  --collection-suffix wm_agilex_100 \
-  --episode 45 \
-  --overwrite
-
+#
+# Parallel robot-only replay across all available tasks.
+#
+# Expected data layout:
+#   <save_path>/<task_name>/<collection_suffix>/data/episode*.hdf5
+#
+# Usage:
+#   bash replay_robot_only.sh [task_config] [num_gpus] [collection_suffix] [save_path] [extra replay args...]
+#
+# Examples:
+#   bash replay_robot_only.sh demo_clean 8 aloha-agilex_clean_50 /path/to/robotwin_data
+#   bash replay_robot_only.sh wm_agilex_100 8 wm_agilex_100_fail
+#
+# Notes:
+#   - If save_path is omitted, the script uses save_path from task_config/<task_config>.yml.
+#   - collection_suffix defaults to task_config.
+#   - Set PYTHON=/path/to/python if your environment does not expose "python".
 # ============================================================
+
+set -uo pipefail
 
 task_config="${1:-wm_agilex_100}"
 num_gpus="${2:-8}"
-collection_suffix="${3:-}"
+collection_suffix="${3:-$task_config}"
+save_path_override="${4:-}"
+extra_replay_args=("${@:5}")
+python_bin="${PYTHON:-python}"
 
-tasks=(
-  # adjust_bottle
-  # beat_block_hammer
-  blocks_ranking_rgb
-  # blocks_ranking_size
-  # click_alarmclock
-  # click_bell
-  # dump_bin_bigbin
-  # grab_roller
-  # handover_block
-  # handover_mic
-  # hanging_mug
-  # lift_pot
-  # move_can_pot
-  # move_pillbottle_pad
-  # move_playingcard_away
-  # move_stapler_pad
-  # open_laptop
-  # open_microwave
-  # pick_diverse_bottles
-  # pick_dual_bottles
-  # place_a2b_left
-  # place_a2b_right
-  # place_bread_basket
-  # place_bread_skillet
-  # place_burger_fries
-  # place_can_basket
-  # place_cans_plasticbox
-  # place_container_plate
-  # place_dual_shoes
-  # place_empty_cup
-  # place_fan
-  # place_mouse_pad
-  # place_object_basket
-  # place_object_scale
-  # place_object_stand
-  # place_phone_stand
-  # place_shoe
-  # press_stapler
-  # put_bottles_dustbin
-  # put_object_cabinet
-  # rotate_qrcode
-  # scan_object
-  # shake_bottle
-  # shake_bottle_horizontally
-  # stack_blocks_three
-  # stack_blocks_two
-  # stack_bowls_three
-  # stack_bowls_two
-  # stamp_seal
-  # turn_switch
-)
+if ! [[ "$num_gpus" =~ ^[0-9]+$ ]] || (( num_gpus < 1 )); then
+  echo "[ERROR] num_gpus must be a positive integer, got: $num_gpus"
+  exit 1
+fi
 
-# tasks=(
-#   place_phone_stand
-#   place_mouse_pad
-#   place_object_scale
-#   press_stapler
-#   place_object_stand
-#   place_shoe
-#   place_object_basket
-#   rotate_qrcode
-#   scan_object
-#   place_cans_plasticbox
-#   put_object_cabinet
-#   shake_bottle
-#   turn_switch
-#   shake_bottle_horizontally
-#   stack_bowls_two
-#   put_bottles_dustbin
-#   stack_bowls_three
-#   stack_blocks_two
-#   stack_blocks_three
-#   stamp_seal
-# )
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR" || exit 1
 
+tmp_tasks="$(mktemp)"
+if ! "$python_bin" - "$SCRIPT_DIR" "$task_config" "$collection_suffix" "$save_path_override" > "$tmp_tasks" <<'PY'
+import sys
+from pathlib import Path
+
+import yaml
+
+repo_root = Path(sys.argv[1]).resolve()
+task_config = sys.argv[2]
+collection_suffix = sys.argv[3]
+save_path_override = sys.argv[4]
+
+cfg_path = repo_root / "task_config" / f"{task_config}.yml"
+if not cfg_path.exists():
+    raise SystemExit(f"[ERROR] Task config not found: {cfg_path}")
+
+with cfg_path.open("r", encoding="utf-8") as f:
+    cfg = yaml.safe_load(f)
+
+save_path = Path(save_path_override) if save_path_override else Path(cfg.get("save_path", "./data"))
+if not save_path.is_absolute():
+    save_path = (repo_root / save_path).resolve()
+
+if not save_path.exists():
+    raise SystemExit(f"[ERROR] save_path does not exist: {save_path}")
+
+tasks = []
+for task_dir in sorted(path for path in save_path.iterdir() if path.is_dir()):
+    data_dir = task_dir / collection_suffix / "data"
+    if data_dir.exists() and any(data_dir.glob("episode*.hdf5")):
+        tasks.append(task_dir.name)
+
+if not tasks:
+    raise SystemExit(
+        "[ERROR] No tasks found. Expected layout: "
+        f"{save_path}/<task_name>/{collection_suffix}/data/episode*.hdf5"
+    )
+
+print(f"[INFO] save_path={save_path}", file=sys.stderr)
+for task in tasks:
+    print(task)
+PY
+then
+  rm -f "$tmp_tasks"
+  exit 1
+fi
+
+tasks=()
+while IFS= read -r task; do
+  [[ -n "$task" ]] && tasks+=("$task")
+done < "$tmp_tasks"
+rm -f "$tmp_tasks"
 
 total=${#tasks[@]}
-task_idx=0
-
-declare -A gpu_pid    # gpu_id -> pid
-declare -A gpu_task   # gpu_id -> task name
-declare -A pid_gpu    # pid   -> gpu_id  ← 新增反向映射，精确定位
-
-LOG_DIR="logs/replay"
+LOG_DIR="logs/replay/${task_config}_${collection_suffix}"
 mkdir -p "$LOG_DIR"
 
-# ── 启动单个任务 ────────────────────────────────────────────
-launch_task() {
+save_path_arg=()
+if [[ -n "$save_path_override" ]]; then
+  save_path_arg=(--save-path "$save_path_override")
+fi
+
+echo "[INFO] task_config=$task_config"
+echo "[INFO] collection_suffix=$collection_suffix"
+echo "[INFO] num_gpus=$num_gpus"
+echo "[INFO] tasks=$total"
+echo "[INFO] logs=$LOG_DIR"
+
+worker() {
   local gpu=$1
-  local task=$2
-  local log_file="$LOG_DIR/${task}.log"
+  local failed=0
+  local task
+  local log_file
 
-  local suffix_arg=""
-  [[ -n "$collection_suffix" ]] && suffix_arg="--collection-suffix $collection_suffix"
+  for (( idx=gpu; idx<total; idx+=num_gpus )); do
+    task="${tasks[$idx]}"
+    log_file="$LOG_DIR/${task}.log"
 
-  echo "[$(date +%T)] 🚀 GPU $gpu -> $task  (log: $log_file)"
-
-  CUDA_VISIBLE_DEVICES="$gpu" \
-    python script/replay_robot_only.py \
-      --task-name   "$task" \
+    echo "[$(date +%T)] GPU $gpu -> $task (log: $log_file)"
+    if CUDA_VISIBLE_DEVICES="$gpu" "$python_bin" script/replay_robot_only.py \
+      --task-name "$task" \
       --task-config "$task_config" \
+      --collection-suffix "$collection_suffix" \
       --all-episodes \
-      $suffix_arg \
-      > "$log_file" 2>&1 &
+      "${save_path_arg[@]}" \
+      "${extra_replay_args[@]}" \
+      > "$log_file" 2>&1; then
+      echo "[$(date +%T)] GPU $gpu done: $task"
+    else
+      echo "[$(date +%T)] GPU $gpu failed: $task -> $log_file"
+      failed=1
+    fi
+  done
 
-  local pid=$!
-  gpu_pid[$gpu]=$pid
-  gpu_task[$gpu]=$task
-  pid_gpu[$pid]=$gpu   # 反向映射
+  return "$failed"
 }
 
-# ── 处理一个已完成的 pid ────────────────────────────────────
-handle_done() {
-  local pid=$1
-  local exit_code=$2
-  local gpu=${pid_gpu[$pid]}
-  local task=${gpu_task[$gpu]}
-
-  unset pid_gpu[$pid]
-
-  if [[ $exit_code -eq 0 ]]; then
-    echo "[$(date +%T)] ✅ GPU $gpu 完成: $task"
-  else
-    echo "[$(date +%T)] ❌ GPU $gpu 失败(exit=$exit_code): $task -> 查看 $LOG_DIR/${task}.log"
-  fi
-
-  # 立刻补充新任务
-  if (( task_idx < total )); then
-    launch_task "$gpu" "${tasks[$task_idx]}"
-    (( task_idx++ ))
-  else
-    unset gpu_pid[$gpu]
-    unset gpu_task[$gpu]
-  fi
-}
-
-# ── 阶段 1：填满所有 GPU ─────────────────────────────────────
-for (( gpu=0; gpu<num_gpus && task_idx<total; gpu++, task_idx++ )); do
-  launch_task "$gpu" "${tasks[$task_idx]}"
+pids=()
+for (( gpu=0; gpu<num_gpus && gpu<total; gpu++ )); do
+  worker "$gpu" &
+  pids+=("$!")
 done
 
-# ── 阶段 2：精确等待，完成一个立刻补一个 ──────────────────────
-while (( task_idx < total )); do
-  # wait -p 将结束的 pid 写入变量，-n 等待任意一个
-  if wait -n -p finished_pid; then
-    exit_code=0
-  else
-    exit_code=$?
-  fi
-
-  # finished_pid 需要 bash 5.1+；旧版本降级处理
-  if [[ -n "${finished_pid:-}" && -n "${pid_gpu[$finished_pid]:-}" ]]; then
-    handle_done "$finished_pid" "$exit_code"
-  else
-    # 降级：轮询找出已结束的进程
-    for pid in "${!pid_gpu[@]}"; do
-      if ! kill -0 "$pid" 2>/dev/null; then
-        wait "$pid"; ec=$?
-        handle_done "$pid" "$ec"
-      fi
-    done
+failed=0
+for pid in "${pids[@]}"; do
+  if ! wait "$pid"; then
+    failed=1
   fi
 done
 
-# ── 阶段 3：等待最后一批 ─────────────────────────────────────
-echo "[$(date +%T)] ⏳ 等待最后 ${#gpu_pid[@]} 个任务完成..."
-for gpu in "${!gpu_pid[@]}"; do
-  pid=${gpu_pid[$gpu]}
-  wait "$pid"; exit_code=$?
-  task=${gpu_task[$gpu]}
-  if [[ $exit_code -eq 0 ]]; then
-    echo "[$(date +%T)] ✅ GPU $gpu 完成: $task"
-  else
-    echo "[$(date +%T)] ❌ GPU $gpu 失败(exit=$exit_code): $task -> 查看 $LOG_DIR/${task}.log"
-  fi
-done
-
-echo ""
-echo "🎉 所有 ${total} 个任务已处理完毕！"
-echo "📁 日志目录: $LOG_DIR"
+if [[ $failed -eq 0 ]]; then
+  echo "[INFO] All ${total} tasks finished."
+else
+  echo "[ERROR] Some tasks failed. Check logs under $LOG_DIR"
+  exit 1
+fi

@@ -111,7 +111,12 @@ def get_embodiment_file(embodiment_type: str, embodiment_types: dict[str, Any]) 
     return resolve_project_path(robot_file)
 
 
-def build_replay_config(task_name: str, task_config_name: str, collection_suffix: str | None = None) -> ReplayConfig:
+def build_replay_config(
+    task_name: str,
+    task_config_name: str,
+    collection_suffix: str | None = None,
+    save_path_override: str | None = None,
+) -> ReplayConfig:
     task_cfg_path = REPO_ROOT / "task_config" / f"{task_config_name}.yml"
     if not task_cfg_path.exists():
         raise FileNotFoundError(f"Task config not found: {task_cfg_path}")
@@ -125,7 +130,8 @@ def build_replay_config(task_name: str, task_config_name: str, collection_suffix
         raise ValueError(f"No embodiment configured in {task_cfg_path}")
 
     collection_folder = collection_suffix if collection_suffix else task_config_name
-    collection_dir = resolve_project_path(task_cfg.get("save_path", "./data")) / task_name / collection_folder
+    save_path = save_path_override if save_path_override is not None else task_cfg.get("save_path", "./data")
+    collection_dir = resolve_project_path(save_path) / task_name / collection_folder
 
     replay_camera_type = task_cfg["camera"]["wrist_camera_type"]
     if replay_camera_type not in camera_types:
@@ -690,13 +696,19 @@ def parse_args() -> argparse.Namespace:
             "will read from <save_path>/<task>/<collection-suffix> "
             "instead of <save_path>/<task>/<task-config>",
     )
+    parser.add_argument(
+        "--save-path",
+        default=None,
+        help="Override save_path from task_config/<task-config>.yml. "
+            "It should be the parent directory containing task folders.",
+    )
 
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    replay_cfg = build_replay_config(args.task_name, args.task_config, args.collection_suffix)
+    replay_cfg = build_replay_config(args.task_name, args.task_config, args.collection_suffix, args.save_path)
 
 
     for path in [replay_cfg.left_robot_file, replay_cfg.right_robot_file]:
