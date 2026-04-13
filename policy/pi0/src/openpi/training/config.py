@@ -447,7 +447,7 @@ _CONFIGS = [
         # model=pi0.Pi0Config(max_token_len=64),
         model=pi0.Pi0Config(),
         data=LeRobotAlohaDataConfig(
-            repo_id="pi0_press_stapler",  # your datasets repo_id
+            repo_id="pi0_adjust_bottle",  # your datasets repo_id
             adapt_to_pi=False,
             repack_transforms=_transforms.Group(inputs=[
                 _transforms.RepackTransform({
@@ -470,7 +470,7 @@ _CONFIGS = [
         batch_size=32,  # the total batch_size not pre_gpu batch_size
         weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=30000,
-        fsdp_devices=4,  # refer line 359
+        fsdp_devices=8,  # refer line 359
     ),
     # pi0_fast_base by full
     TrainConfig(
