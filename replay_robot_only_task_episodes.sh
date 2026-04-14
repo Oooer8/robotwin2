@@ -123,18 +123,18 @@ echo "[INFO] num_gpus=$num_gpus"
 echo "[INFO] episodes=$total"
 echo "[INFO] logs=$LOG_DIR"
 
-worker() {
+next_idx=0
+failed=0
+running_pids=()
+running_episodes=()
+
+launch_episode() {
   local gpu=$1
-  local failed=0
-  local episode
-  local log_file
+  local episode=$2
+  local log_file="$LOG_DIR/episode${episode}.log"
 
-  for (( idx=gpu; idx<total; idx+=num_gpus )); do
-    episode="${episodes[$idx]}"
-    log_file="$LOG_DIR/episode${episode}.log"
-
-    echo "[$(date +%T)] GPU $gpu -> ${task_name}/episode${episode} (log: $log_file)"
-    if CUDA_VISIBLE_DEVICES="$gpu" "$python_bin" script/replay_robot_only.py \
+  echo "[$(date +%T)] GPU $gpu -> ${task_name}/episode${episode} (log: $log_file)"
+  CUDA_VISIBLE_DEVICES="$gpu" "$python_bin" script/replay_robot_only.py \
       --task-name "$task_name" \
       --task-config "$task_config" \
       --collection-suffix "$collection_suffix" \
@@ -142,27 +142,58 @@ worker() {
       "${overwrite_arg[@]}" \
       "${save_path_arg[@]}" \
       "${extra_replay_args[@]}" \
-      > "$log_file" 2>&1; then
-      echo "[$(date +%T)] GPU $gpu done: ${task_name}/episode${episode}"
-    else
-      echo "[$(date +%T)] GPU $gpu failed: ${task_name}/episode${episode} -> $log_file"
-      failed=1
+      > "$log_file" 2>&1 &
+
+  running_pids[$gpu]=$!
+  running_episodes[$gpu]=$episode
+}
+
+handle_done() {
+  local gpu=$1
+  local pid="${running_pids[$gpu]}"
+  local episode="${running_episodes[$gpu]}"
+  local log_file="$LOG_DIR/episode${episode}.log"
+  local exit_code
+
+  wait "$pid"
+  exit_code=$?
+  running_pids[$gpu]=""
+  running_episodes[$gpu]=""
+
+  if [[ $exit_code -eq 0 ]]; then
+    echo "[$(date +%T)] GPU $gpu done: ${task_name}/episode${episode}"
+  else
+    echo "[$(date +%T)] GPU $gpu failed(exit=$exit_code): ${task_name}/episode${episode} -> $log_file"
+    failed=1
+  fi
+
+  (( active_count-- ))
+  if (( next_idx < total )); then
+    launch_episode "$gpu" "${episodes[$next_idx]}"
+    (( next_idx++ ))
+    (( active_count++ ))
+  fi
+}
+
+active_count=0
+for (( gpu=0; gpu<num_gpus && next_idx<total; gpu++ )); do
+  launch_episode "$gpu" "${episodes[$next_idx]}"
+  (( next_idx++ ))
+  (( active_count++ ))
+done
+
+while (( active_count > 0 )); do
+  made_progress=0
+  for (( gpu=0; gpu<num_gpus; gpu++ )); do
+    pid="${running_pids[$gpu]:-}"
+    if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
+      handle_done "$gpu"
+      made_progress=1
     fi
   done
 
-  return "$failed"
-}
-
-pids=()
-for (( gpu=0; gpu<num_gpus && gpu<total; gpu++ )); do
-  worker "$gpu" &
-  pids+=("$!")
-done
-
-failed=0
-for pid in "${pids[@]}"; do
-  if ! wait "$pid"; then
-    failed=1
+  if (( made_progress == 0 )); then
+    sleep 2
   fi
 done
 
