@@ -18,6 +18,7 @@
 #   - If save_path is omitted, the script uses save_path from task_config/<task_config>.yml.
 #   - collection_suffix defaults to task_config.
 #   - Set PYTHON=/path/to/python if your environment does not expose "python".
+#   - Existing complete episodes are skipped by default. Pass --force-overwrite to regenerate them.
 # ============================================================
 
 set -uo pipefail
@@ -29,6 +30,7 @@ collection_suffix="${4:-$task_config}"
 save_path_override="${5:-}"
 extra_replay_args=("${@:6}")
 python_bin="${PYTHON:-python}"
+overwrite_arg=()
 
 if [[ -z "$task_name" ]]; then
   echo "Usage: bash $0 <task_name> [task_config] [num_gpus] [collection_suffix] [save_path] [extra replay args...]"
@@ -40,6 +42,16 @@ if ! [[ "$num_gpus" =~ ^[0-9]+$ ]] || (( num_gpus < 1 )); then
   echo "[ERROR] num_gpus must be a positive integer, got: $num_gpus"
   exit 1
 fi
+
+filtered_extra_args=()
+for arg in "${extra_replay_args[@]}"; do
+  if [[ "$arg" == "--force-overwrite" ]]; then
+    overwrite_arg=(--overwrite)
+  else
+    filtered_extra_args+=("$arg")
+  fi
+done
+extra_replay_args=("${filtered_extra_args[@]}")
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR" || exit 1
@@ -127,7 +139,7 @@ worker() {
       --task-config "$task_config" \
       --collection-suffix "$collection_suffix" \
       --episode "$episode" \
-      # --overwrite \
+      "${overwrite_arg[@]}" \
       "${save_path_arg[@]}" \
       "${extra_replay_args[@]}" \
       > "$log_file" 2>&1; then
