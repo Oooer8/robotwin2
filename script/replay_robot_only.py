@@ -191,8 +191,7 @@ def build_replay_config(
     )
 
 
-def get_episode_paths(collection_dir: Path, episode: int | None, all_episodes: bool) -> list[Path]:
-    data_dir = collection_dir / "data"
+def get_episode_paths_from_data_dir(data_dir: Path, episode: int | None, all_episodes: bool) -> list[Path]:
     if not data_dir.exists():
         raise FileNotFoundError(f"Collected episode directory not found: {data_dir}")
 
@@ -212,6 +211,10 @@ def get_episode_paths(collection_dir: Path, episode: int | None, all_episodes: b
     if not episode_path.exists():
         raise FileNotFoundError(f"Episode file not found: {episode_path}")
     return [episode_path]
+
+
+def get_episode_paths(collection_dir: Path, episode: int | None, all_episodes: bool) -> list[Path]:
+    return get_episode_paths_from_data_dir(collection_dir / "data", episode, all_episodes)
 
 
 def load_episode_states(hdf5_path: Path) -> tuple[np.ndarray, int, int]:
@@ -532,7 +535,9 @@ def render_camera_rgb(camera: Any) -> np.ndarray:
     return rgb
 
 
-def build_output_dir(collection_dir: Path, episode_idx: int) -> Path:
+def build_output_dir(collection_dir: Path, episode_idx: int, output_root: Path | None = None) -> Path:
+    if output_root is not None:
+        return output_root / f"episode{episode_idx}"
     return collection_dir / "robot_only_replay" / f"episode{episode_idx}"
 
 
@@ -543,13 +548,14 @@ def replay_episode(
     distance_scale: float,
     max_frames: int | None,
     overwrite: bool,
+    output_root: Path | None = None,
 ) -> dict[str, Any]:
     states, left_arm_dim, right_arm_dim = load_episode_states(hdf5_path)
     if max_frames is not None:
         states = states[:max_frames]
 
     episode_idx = int(hdf5_path.stem.replace("episode", ""))
-    output_dir = build_output_dir(replay_cfg.collection_dir, episode_idx)
+    output_dir = build_output_dir(replay_cfg.collection_dir, episode_idx, output_root)
     view_paths = {view: output_dir / f"{view}.mp4" for view in ("front", "side", "top", "head")}
     manifest_path = output_dir / "manifest.json"
 
@@ -672,7 +678,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Render robot-only replay videos from RobotWin2 collected joint trajectories."
     )
-    parser.add_argument("--task-name", required=True, help="Task name, e.g. beat_block_hammer")
+    parser.add_argument(
+        "--task-name",
+        help="Task name, e.g. beat_block_hammer. Optional when --data-dir is provided.",
+    )
     parser.add_argument("--task-config", required=True, help="Task config name without .yml, e.g. demo_clean")
     parser.add_argument("--episode", type=int, help="Single episode index to render")
     parser.add_argument(
@@ -702,13 +711,36 @@ def parse_args() -> argparse.Namespace:
         help="Override save_path from task_config/<task-config>.yml. "
             "It should be the parent directory containing task folders.",
     )
+    parser.add_argument(
+        "--data-dir",
+        default=None,
+        help="Directly read episode*.hdf5 from this directory instead of "
+            "<save_path>/<task-name>/<collection-suffix>/data.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Output root for replay videos. Defaults to <collection-dir>/robot_only_replay "
+            "or <data-dir>/robot_only_replay in --data-dir mode.",
+    )
 
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    replay_cfg = build_replay_config(args.task_name, args.task_config, args.collection_suffix, args.save_path)
+    direct_data_dir = Path(args.data_dir).expanduser().resolve() if args.data_dir else None
+    task_name = args.task_name
+    if task_name is None:
+        if direct_data_dir is None:
+            raise ValueError("--task-name is required unless --data-dir is provided")
+        task_name = direct_data_dir.name
+
+    replay_cfg = build_replay_config(task_name, args.task_config, args.collection_suffix, args.save_path)
+    if direct_data_dir is not None:
+        if not direct_data_dir.is_dir():
+            raise FileNotFoundError(f"--data-dir does not exist or is not a directory: {direct_data_dir}")
+        replay_cfg.collection_dir = direct_data_dir
 
 
     for path in [replay_cfg.left_robot_file, replay_cfg.right_robot_file]:
@@ -717,7 +749,12 @@ def main() -> None:
                 f"Robot embodiment assets not found: {path}. Please download/install the assets first."
             )
 
-    episode_paths = get_episode_paths(replay_cfg.collection_dir, args.episode, args.all_episodes)
+    if direct_data_dir is not None:
+        episode_paths = get_episode_paths_from_data_dir(direct_data_dir, args.episode, args.all_episodes)
+    else:
+        episode_paths = get_episode_paths(replay_cfg.collection_dir, args.episode, args.all_episodes)
+
+    output_root = Path(args.output_dir).expanduser().resolve() if args.output_dir else None
     results = []
     for hdf5_path in episode_paths:
         result = replay_episode(
@@ -727,6 +764,7 @@ def main() -> None:
             distance_scale=args.distance_scale,
             max_frames=args.max_frames,
             overwrite=args.overwrite,
+            output_root=output_root,
         )
         results.append(result)
         print(json.dumps(result, ensure_ascii=False))
@@ -735,10 +773,11 @@ def main() -> None:
         json.dumps(
             {
                 "task_name": args.task_name,
+                "resolved_task_name": task_name,
                 "task_config": args.task_config,
                 "episodes": len(results),
                 "collection_dir": str(replay_cfg.collection_dir.resolve()),
-                "replay_dir": str((replay_cfg.collection_dir / "robot_only_replay").resolve()),
+                "replay_dir": str((output_root or (replay_cfg.collection_dir / "robot_only_replay")).resolve()),
             },
             ensure_ascii=False,
         )
