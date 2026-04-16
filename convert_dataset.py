@@ -141,6 +141,13 @@ def parse_task_names(raw: str | None) -> list[str] | None:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+def parse_episode_video_file(path: Path) -> tuple[int, str] | None:
+    match = re.match(r"^episode(\d+)(?:_(.+))?$", path.stem)
+    if not match:
+        return None
+    return int(match.group(1)), match.group(2) or "head"
+
+
 def data_dir_has_markers(path: Path) -> bool:
     if not path.exists() or not path.is_dir():
         return False
@@ -279,11 +286,18 @@ def build_task_list(
 
 
 def parse_video_view(path: Path, ep_num: int) -> str | None:
-    pattern = re.compile(rf"^episode{ep_num}(?:_(.+))?$")
-    match = pattern.match(path.stem)
-    if not match:
+    parsed = parse_episode_video_file(path)
+    if parsed is None:
         return None
-    return match.group(1) or "head"
+    parsed_ep_num, view = parsed
+    if parsed_ep_num != ep_num:
+        return None
+    return view
+
+
+def video_source_path(video_dir: Path, ep_name: str, view: str) -> Path:
+    file_name = f"{ep_name}.mp4" if view == "head" else f"{ep_name}_{view}.mp4"
+    return video_dir / file_name
 
 
 def collect_episode_indices(data_dir: Path) -> set[int]:
@@ -336,6 +350,19 @@ def discover_video_files(video_dir: Path, ep_num: int) -> dict[str, Path]:
     return files
 
 
+def discover_video_views(video_dir: Path) -> list[str]:
+    if not video_dir.exists():
+        return []
+
+    views: set[str] = set()
+    for path in video_dir.glob("episode*.mp4"):
+        parsed = parse_episode_video_file(path)
+        if parsed is not None:
+            _, view = parsed
+            views.add(view)
+    return sorted(views, key=natural_sort_key)
+
+
 def discover_replay_files(replay_episode_dir: Path) -> dict[str, Path]:
     if not replay_episode_dir.exists():
         return {}
@@ -345,10 +372,30 @@ def discover_replay_files(replay_episode_dir: Path) -> dict[str, Path]:
     }
 
 
+def discover_replay_views(replay_dir: Path) -> list[str]:
+    if not replay_dir.exists():
+        return []
+
+    views: set[str] = set()
+    for path in replay_dir.glob("episode*/*.mp4"):
+        views.add(path.stem)
+    return sorted(views, key=natural_sort_key)
+
+
 def select_views(discovered: dict[str, Path], requested_views: list[str] | None) -> list[str]:
     if requested_views is None:
         return sorted(discovered, key=natural_sort_key)
     return requested_views
+
+
+def find_missing_episode_indices(episode_indices: set[int], expected_episodes: int | None) -> list[int]:
+    if expected_episodes is not None:
+        expected = set(range(expected_episodes))
+    elif episode_indices:
+        expected = set(range(max(episode_indices) + 1))
+    else:
+        expected = set()
+    return sorted(expected - episode_indices)
 
 
 def format_counts(counts: Counter[str]) -> str:
@@ -433,6 +480,7 @@ def process(
     video_views: list[str] | None = None,
     replay_views: list[str] | None = None,
     extract_frame_views: list[str] | None = None,
+    expected_episodes: int | None = None,
     allow_variant_fallback: bool = False,
     dry_run: bool = False,
     overwrite: bool = True,
@@ -453,6 +501,7 @@ def process(
     copied_replays: Counter[str] = Counter()
     extracted_frames: Counter[str] = Counter()
     missing_files: list[str] = []
+    missing_episode_reports: list[dict[str, object]] = []
     skipped_tasks = 0
 
     extract_all_frames = extract_frame_views is None
@@ -483,6 +532,35 @@ def process(
             print("  [WARN] 未找到任何 episode，跳过。")
             continue
 
+        task_video_views = video_views if video_views is not None else discover_video_views(video_dir)
+        task_replay_views = replay_views if replay_views is not None else discover_replay_views(replay_dir)
+        missing_episode_indices = find_missing_episode_indices(episode_indices, expected_episodes)
+        for missing_ep_num in missing_episode_indices:
+            ep_code = f"{missing_ep_num:03d}"
+            key = f"{task_code}{ep_code}"
+            ep_name = f"episode{missing_ep_num}"
+            expected_video_files = [
+                str(video_source_path(video_dir, ep_name, view))
+                for view in task_video_views
+            ]
+            expected_replay_files = [
+                str(replay_dir / ep_name / f"{view}.mp4")
+                for view in task_replay_views
+            ]
+            expected_instruction_file = str(instruction_dir / f"{ep_name}.json")
+            missing_episode_reports.append(
+                {
+                    "task": task_dir.name,
+                    "task_code": task_code,
+                    "episode": missing_ep_num,
+                    "key": key,
+                    "video_files": expected_video_files,
+                    "replay_files": expected_replay_files,
+                    "instruction_file": expected_instruction_file,
+                }
+            )
+            print(f"  [MISS_EP] episode {missing_ep_num:>3d}  ->  key={key}")
+
         for ep_num in sorted(episode_indices):
             ep_code = f"{ep_num:03d}"
             key = f"{task_code}{ep_code}"
@@ -491,13 +569,12 @@ def process(
 
             # 1. 真实采集/仿真 observation 视频，多视角自动发现。
             discovered_video_files = discover_video_files(video_dir, ep_num)
-            for view in select_views(discovered_video_files, video_views):
+            for view in task_video_views:
                 src_video = discovered_video_files.get(view)
                 if src_video is None:
-                    if video_views is not None:
-                        expected = video_dir / (f"{ep_name}.mp4" if view == "head" else f"{ep_name}_{view}.mp4")
-                        missing_files.append(str(expected))
-                        print(f"    [MISS] video {view}: {expected}")
+                    expected = video_source_path(video_dir, ep_name, view)
+                    missing_files.append(str(expected))
+                    print(f"    [MISS] video {view}: {expected}")
                     continue
 
                 dst_video = camera_video_output(output_root, key, view)
@@ -527,13 +604,12 @@ def process(
             # 3. robot_only_replay / URDF 视频，多视角自动发现。
             ep_replay_dir = replay_dir / ep_name
             discovered_replay_files = discover_replay_files(ep_replay_dir)
-            for view in select_views(discovered_replay_files, replay_views):
+            for view in task_replay_views:
                 src_replay = discovered_replay_files.get(view)
                 if src_replay is None:
-                    if replay_views is not None:
-                        expected = ep_replay_dir / f"{view}.mp4"
-                        missing_files.append(str(expected))
-                        print(f"    [MISS] replay {view}: {expected}")
+                    expected = ep_replay_dir / f"{view}.mp4"
+                    missing_files.append(str(expected))
+                    print(f"    [MISS] replay {view}: {expected}")
                     continue
 
                 dst_replay = replay_video_output(output_root, key, view)
@@ -557,6 +633,24 @@ def process(
     print(f"   首帧图片       : {format_counts(extracted_frames)}")
     print(f"   replay 视频    : {format_counts(copied_replays)}")
     print(f"   prompts 条目   : {len(prompts)} 条")
+    if missing_episode_reports:
+        print(f"\n缺失 episode（共 {len(missing_episode_reports)} 个）:")
+        for item in missing_episode_reports:
+            print(
+                f"   - Task {item['task_code']} {item['task']}: "
+                f"episode{item['episode']} -> key={item['key']}"
+            )
+            print(f"     instruction: {item['instruction_file']}")
+            video_files = item["video_files"]
+            replay_files = item["replay_files"]
+            if video_files:
+                print("     video:")
+                for path in video_files:
+                    print(f"       - {path}")
+            if replay_files:
+                print("     replay:")
+                for path in replay_files:
+                    print(f"       - {path}")
     if missing_files:
         print(f"\n缺失文件（共 {len(missing_files)} 个）:")
         for path in missing_files:
@@ -618,6 +712,12 @@ def main() -> None:
         help="要提取首帧 jpg 的 video 视角，逗号分隔；可用 all 或 none，默认 head",
     )
     parser.add_argument(
+        "--expected-episodes",
+        type=int,
+        default=None,
+        help="每个任务期望的 episode 数，例如 50；用于检测末尾也缺失的 episode",
+    )
+    parser.add_argument(
         "--allow-variant-fallback",
         action="store_true",
         help="指定 variant 不存在时，允许回退到该任务下第一个可用数据目录",
@@ -642,6 +742,9 @@ def main() -> None:
     print(f"输入: {robotwin_root}")
     print(f"输出: {output_root}")
 
+    if args.expected_episodes is not None and args.expected_episodes < 0:
+        raise ValueError("--expected-episodes 不能小于 0")
+
     process(
         robotwin_root,
         output_root,
@@ -652,6 +755,7 @@ def main() -> None:
         video_views=parse_csv(args.video_views),
         replay_views=parse_csv(args.replay_views),
         extract_frame_views=parse_csv(args.extract_frame_views),
+        expected_episodes=args.expected_episodes,
         allow_variant_fallback=args.allow_variant_fallback,
         dry_run=args.dry_run,
         overwrite=args.overwrite,
