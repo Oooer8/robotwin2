@@ -1,0 +1,20 @@
+# Basic experiment configuration (required by RoboTwin eval_policy.py)
+policy_name: null
+task_name: null
+task_config: null
+ckpt_setting: null
+seed: null
+instruction_type: "unseen"
+# Cosmos Policy remote adapter configuration
+server_endpoint: "http://127.0.0.1:8777/act"
+request_timeout_sec: 60.0
+input_image_size: 224
+# Client-side open-loop execution length before the adapter re-queries /act
+num_open_loop_steps: 50
+return_all_query_results: false
+action_type: "qpos"
+strict_action_dim: true
+swap_bgr_to_rgb: false
+use_task_name_as_instruction: false
+sleep_after_action_sec: 0.0
+default_task_description: ""

@@ -18,22 +18,22 @@ collection_suffix="${3:-}"
 tasks=(
   # adjust_bottle
   # beat_block_hammer
-  # blocks_ranking_rgb
+  blocks_ranking_rgb
   # blocks_ranking_size
   # click_alarmclock
   # click_bell
   # dump_bin_bigbin
-  grab_roller
+  # grab_roller
   # handover_block
   # handover_mic
-  hanging_mug
+  # hanging_mug
   # lift_pot
   # move_can_pot
   # move_pillbottle_pad
   # move_playingcard_away
   # move_stapler_pad
   # open_laptop
-  open_microwave
+  # open_microwave
   # pick_diverse_bottles
   # pick_dual_bottles
   # place_a2b_left
@@ -62,7 +62,7 @@ tasks=(
   # shake_bottle_horizontally
   # stack_blocks_three
   # stack_blocks_two
-  stack_bowls_three
+  # stack_bowls_three
   # stack_bowls_two
   # stamp_seal
   # turn_switch

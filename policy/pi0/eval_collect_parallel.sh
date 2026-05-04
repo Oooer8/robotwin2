@@ -1,18 +1,16 @@
 #!/bin/bash
 # cd /Users/oooer/ws/RoboTwin/policy/pi0
 # bash eval_collect_parallel.sh \
-#   grab_roller \
+#   adjust_bottle \
 #   wm_agilex_100 \
 #   pi0_base_aloha_robotwin_full \
-#   pi0_grab_roller \
-#   4 \
-#   50 \
-#   100000 \
-#   0
-# 4: 用 4 张 GPU 并行
+#   pi0_adjust_bottle 8 50 100000 0
+#   --checkpoint_id 40000
+# 8: 用 8 张 GPU 并行
 # 50: 总共收 50 个 episode，不是每张卡 50 个
 # 100000: 起始 seed
 # 0: GPU 起始编号，表示用 0,1,2,3
+
 
 set -euo pipefail
 
