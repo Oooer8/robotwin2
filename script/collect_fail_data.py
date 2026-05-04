@@ -47,6 +47,7 @@ def should_collect_episode(task_env):
 def get_noise_config(args):
     noise_cfg = deepcopy(args.get("trajectory_noise", {}))
     noise_cfg.setdefault("source_task_config", args["task_config"])
+    noise_cfg.setdefault("target_task_config", None)
     noise_cfg.setdefault("output_suffix", "fail")
     noise_cfg.setdefault("random_seed", 0)
     noise_cfg.setdefault("noise_type", "random_walk")
@@ -69,11 +70,13 @@ def get_source_and_target_save_path(args, noise_cfg):
     source_task_config = noise_cfg["source_task_config"]
     source_save_path = os.path.join(base_save_path, str(args["task_name"]), source_task_config)
 
-    output_suffix = str(noise_cfg["output_suffix"]).strip()
-    if output_suffix:
-        target_task_config = f"{args['task_config']}_{output_suffix}"
-    else:
-        target_task_config = args["task_config"]
+    target_task_config = noise_cfg.get("target_task_config")
+    if not target_task_config:
+        output_suffix = str(noise_cfg["output_suffix"]).strip()
+        if output_suffix:
+            target_task_config = f"{source_task_config}_{output_suffix}"
+        else:
+            target_task_config = source_task_config
     target_save_path = os.path.join(base_save_path, str(args["task_name"]), target_task_config)
     return source_save_path, target_save_path, target_task_config
 
@@ -378,12 +381,48 @@ def safe_remove_data_cache(task_env):
             pass
 
 
-def main(task_name=None, task_config=None):
+def apply_cli_overrides(
+    args,
+    source_collection_suffix=None,
+    target_collection_suffix=None,
+    output_suffix=None,
+    save_path=None,
+):
+    if save_path:
+        args["save_path"] = save_path
+
+    if source_collection_suffix or target_collection_suffix or output_suffix is not None:
+        args.setdefault("trajectory_noise", {})
+
+    if source_collection_suffix:
+        args["trajectory_noise"]["source_task_config"] = source_collection_suffix
+    if target_collection_suffix:
+        args["trajectory_noise"]["target_task_config"] = target_collection_suffix
+    if output_suffix is not None:
+        args["trajectory_noise"]["output_suffix"] = output_suffix
+
+
+def main(
+    task_name=None,
+    task_config=None,
+    source_collection_suffix=None,
+    target_collection_suffix=None,
+    output_suffix=None,
+    save_path=None,
+):
     task = class_decorator(task_name)
     config_path = f"./task_config/{task_config}.yml"
 
     with open(config_path, "r", encoding="utf-8") as f:
         args = yaml.load(f.read(), Loader=yaml.FullLoader)
+
+    apply_cli_overrides(
+        args,
+        source_collection_suffix=source_collection_suffix,
+        target_collection_suffix=target_collection_suffix,
+        output_suffix=output_suffix,
+        save_path=save_path,
+    )
 
     args["task_name"] = task_name
     args["task_config"] = task_config
@@ -641,6 +680,35 @@ if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("task_name", type=str)
     parser.add_argument("task_config", type=str)
+    parser.add_argument(
+        "--source-collection-suffix",
+        "--source-task-config",
+        dest="source_collection_suffix",
+        default=None,
+        help="Source collection directory under <save_path>/<task_name>/, e.g. aloha-agilex_clean_50.",
+    )
+    parser.add_argument(
+        "--target-collection-suffix",
+        default=None,
+        help="Exact target fail collection directory. Defaults to <source_collection_suffix>_<output_suffix>.",
+    )
+    parser.add_argument(
+        "--output-suffix",
+        default=None,
+        help="Suffix appended to the source collection when target collection is not set. Default: fail.",
+    )
+    parser.add_argument(
+        "--save-path",
+        default=None,
+        help="Parent directory containing task folders. Overrides save_path in task_config/<task_config>.yml.",
+    )
     parser = parser.parse_args()
 
-    main(task_name=parser.task_name, task_config=parser.task_config)
+    main(
+        task_name=parser.task_name,
+        task_config=parser.task_config,
+        source_collection_suffix=parser.source_collection_suffix,
+        target_collection_suffix=parser.target_collection_suffix,
+        output_suffix=parser.output_suffix,
+        save_path=parser.save_path,
+    )

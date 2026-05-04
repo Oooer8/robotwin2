@@ -8,7 +8,11 @@ from typing import Any
 
 import h5py
 import numpy as np
-import yaml
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -39,6 +43,8 @@ def infer_collection_dir(
     task_cfg_path = REPO_ROOT / "task_config" / f"{task_config}.yml"
     if not task_cfg_path.exists():
         raise FileNotFoundError(f"Task config not found: {task_cfg_path}")
+    if yaml is None:
+        raise ImportError("PyYAML is required when resolving collection_dir from task_config/*.yml.")
 
     with open(task_cfg_path, "r", encoding="utf-8") as f:
         task_cfg = yaml.safe_load(f)

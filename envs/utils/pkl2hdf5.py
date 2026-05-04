@@ -6,6 +6,12 @@ from collections.abc import Mapping, Sequence
 import shutil
 from .images_to_video import images_to_video
 
+CAMERA_VIDEO_SUFFIXES = {
+    "head_camera": "",
+    "left_camera": "_left_camera",
+    "right_camera": "_right_camera",
+}
+
 
 def images_encoding(imgs):
     encode_data = []
@@ -75,13 +81,30 @@ def create_hdf5_from_dict(hdf5_group, data_dict):
                 print(f"Error storing value for key '{key}': {e}")
 
 
+def get_camera_video_path(video_path, camera_name):
+    base_path, ext = os.path.splitext(video_path)
+    suffix = CAMERA_VIDEO_SUFFIXES[camera_name]
+    return f"{base_path}{suffix}{ext}"
+
+
+def images_to_camera_videos(data_list, video_path):
+    observation = data_list.get("observation", {})
+    for camera_name in CAMERA_VIDEO_SUFFIXES:
+        camera_data = observation.get(camera_name)
+        if not isinstance(camera_data, dict) or "rgb" not in camera_data:
+            continue
+
+        camera_video_path = get_camera_video_path(video_path, camera_name)
+        images_to_video(np.array(camera_data["rgb"]), out_path=camera_video_path)
+
+
 def pkl_files_to_hdf5_and_video(pkl_files, hdf5_path, video_path):
     data_list = parse_dict_structure(load_pkl_file(pkl_files[0]))
     for pkl_file_path in pkl_files:
         pkl_file = load_pkl_file(pkl_file_path)
         append_data_to_structure(data_list, pkl_file)
 
-    images_to_video(np.array(data_list["observation"]["head_camera"]["rgb"]), out_path=video_path)
+    images_to_camera_videos(data_list, video_path)
 
     with h5py.File(hdf5_path, "w") as f:
         create_hdf5_from_dict(f, data_list)

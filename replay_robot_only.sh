@@ -1,15 +1,26 @@
 #!/bin/bash
 # ============================================================
 # replay_robot_only.sh
-# 要先修改task config，确保路径正确
-# 确保start seed注释掉
-# 用法: bash replay_robot_only.sh [task_config] [num_gpus]
-
-# 读 wm_agilex_100_fail 文件夹，但用 wm_agilex_100.yml 的配置
-# bash replay_robot_only.sh wm_agilex_100 8 wm_agilex_100_fail
-# 不传第三个参数，行为与原来完全一致（读 wm_agilex_100 文件夹）
-# bash replay_robot_only.sh wm_agilex_100 8
+#
+# Parallel robot-only replay across all available tasks.
+#
+# Expected data layout:
+#   <save_path>/<task_name>/<collection_suffix>/data/episode*.hdf5
+#
+# Usage:
+#   bash replay_robot_only.sh [task_config] [num_gpus] [collection_suffix] [save_path] [extra replay args...]
+#
+# Examples:
+#   bash replay_robot_only.sh demo_clean 8 aloha-agilex_clean_50 /path/to/robotwin_data
+#   bash replay_robot_only.sh wm_agilex_100 8 wm_agilex_100_fail
+#
+# Notes:
+#   - If save_path is omitted, the script uses save_path from task_config/<task_config>.yml.
+#   - collection_suffix defaults to task_config.
+#   - Set PYTHON=/path/to/python if your environment does not expose "python".
 # ============================================================
+
+set -uo pipefail
 
 task_config="${1:-wm_agilex_100}"
 num_gpus="${2:-8}"
@@ -93,106 +104,96 @@ tasks=(
 
 
 total=${#tasks[@]}
-task_idx=0
-
-declare -A gpu_pid    # gpu_id -> pid
-declare -A gpu_task   # gpu_id -> task name
-declare -A pid_gpu    # pid   -> gpu_id  ← 新增反向映射，精确定位
-
-LOG_DIR="logs/replay"
+LOG_DIR="logs/replay/${task_config}_${collection_suffix}"
 mkdir -p "$LOG_DIR"
 
-# ── 启动单个任务 ────────────────────────────────────────────
+save_path_arg=()
+if [[ -n "$save_path_override" ]]; then
+  save_path_arg=(--save-path "$save_path_override")
+fi
+
+echo "[INFO] task_config=$task_config"
+echo "[INFO] collection_suffix=$collection_suffix"
+echo "[INFO] num_gpus=$num_gpus"
+echo "[INFO] tasks=$total"
+echo "[INFO] logs=$LOG_DIR"
+
+next_idx=0
+failed=0
+running_pids=()
+running_tasks=()
+
 launch_task() {
   local gpu=$1
   local task=$2
   local log_file="$LOG_DIR/${task}.log"
 
-  local suffix_arg=""
-  [[ -n "$collection_suffix" ]] && suffix_arg="--collection-suffix $collection_suffix"
-
-  echo "[$(date +%T)] 🚀 GPU $gpu -> $task  (log: $log_file)"
-
-  CUDA_VISIBLE_DEVICES="$gpu" \
-    python script/replay_robot_only.py \
-      --task-name   "$task" \
+  echo "[$(date +%T)] GPU $gpu -> $task (log: $log_file)"
+  CUDA_VISIBLE_DEVICES="$gpu" "$python_bin" script/replay_robot_only.py \
+      --task-name "$task" \
       --task-config "$task_config" \
+      --collection-suffix "$collection_suffix" \
       --all-episodes \
-      $suffix_arg \
+      "${save_path_arg[@]}" \
+      "${extra_replay_args[@]}" \
       > "$log_file" 2>&1 &
 
-  local pid=$!
-  gpu_pid[$gpu]=$pid
-  gpu_task[$gpu]=$task
-  pid_gpu[$pid]=$gpu   # 反向映射
+  running_pids[$gpu]=$!
+  running_tasks[$gpu]=$task
 }
 
-# ── 处理一个已完成的 pid ────────────────────────────────────
 handle_done() {
-  local pid=$1
-  local exit_code=$2
-  local gpu=${pid_gpu[$pid]}
-  local task=${gpu_task[$gpu]}
+  local gpu=$1
+  local pid="${running_pids[$gpu]}"
+  local task="${running_tasks[$gpu]}"
+  local log_file="$LOG_DIR/${task}.log"
+  local exit_code
 
-  unset pid_gpu[$pid]
+  wait "$pid"
+  exit_code=$?
+  running_pids[$gpu]=""
+  running_tasks[$gpu]=""
 
   if [[ $exit_code -eq 0 ]]; then
-    echo "[$(date +%T)] ✅ GPU $gpu 完成: $task"
+    echo "[$(date +%T)] GPU $gpu done: $task"
   else
-    echo "[$(date +%T)] ❌ GPU $gpu 失败(exit=$exit_code): $task -> 查看 $LOG_DIR/${task}.log"
+    echo "[$(date +%T)] GPU $gpu failed(exit=$exit_code): $task -> $log_file"
+    failed=1
   fi
 
-  # 立刻补充新任务
-  if (( task_idx < total )); then
-    launch_task "$gpu" "${tasks[$task_idx]}"
-    (( task_idx++ ))
-  else
-    unset gpu_pid[$gpu]
-    unset gpu_task[$gpu]
+  (( active_count-- ))
+  if (( next_idx < total )); then
+    launch_task "$gpu" "${tasks[$next_idx]}"
+    (( next_idx++ ))
+    (( active_count++ ))
   fi
 }
 
-# ── 阶段 1：填满所有 GPU ─────────────────────────────────────
-for (( gpu=0; gpu<num_gpus && task_idx<total; gpu++, task_idx++ )); do
-  launch_task "$gpu" "${tasks[$task_idx]}"
+active_count=0
+for (( gpu=0; gpu<num_gpus && next_idx<total; gpu++ )); do
+  launch_task "$gpu" "${tasks[$next_idx]}"
+  (( next_idx++ ))
+  (( active_count++ ))
 done
 
-# ── 阶段 2：精确等待，完成一个立刻补一个 ──────────────────────
-while (( task_idx < total )); do
-  # wait -p 将结束的 pid 写入变量，-n 等待任意一个
-  if wait -n -p finished_pid; then
-    exit_code=0
-  else
-    exit_code=$?
-  fi
+while (( active_count > 0 )); do
+  made_progress=0
+  for (( gpu=0; gpu<num_gpus; gpu++ )); do
+    pid="${running_pids[$gpu]:-}"
+    if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
+      handle_done "$gpu"
+      made_progress=1
+    fi
+  done
 
-  # finished_pid 需要 bash 5.1+；旧版本降级处理
-  if [[ -n "${finished_pid:-}" && -n "${pid_gpu[$finished_pid]:-}" ]]; then
-    handle_done "$finished_pid" "$exit_code"
-  else
-    # 降级：轮询找出已结束的进程
-    for pid in "${!pid_gpu[@]}"; do
-      if ! kill -0 "$pid" 2>/dev/null; then
-        wait "$pid"; ec=$?
-        handle_done "$pid" "$ec"
-      fi
-    done
+  if (( made_progress == 0 )); then
+    sleep 2
   fi
 done
 
-# ── 阶段 3：等待最后一批 ─────────────────────────────────────
-echo "[$(date +%T)] ⏳ 等待最后 ${#gpu_pid[@]} 个任务完成..."
-for gpu in "${!gpu_pid[@]}"; do
-  pid=${gpu_pid[$gpu]}
-  wait "$pid"; exit_code=$?
-  task=${gpu_task[$gpu]}
-  if [[ $exit_code -eq 0 ]]; then
-    echo "[$(date +%T)] ✅ GPU $gpu 完成: $task"
-  else
-    echo "[$(date +%T)] ❌ GPU $gpu 失败(exit=$exit_code): $task -> 查看 $LOG_DIR/${task}.log"
-  fi
-done
-
-echo ""
-echo "🎉 所有 ${total} 个任务已处理完毕！"
-echo "📁 日志目录: $LOG_DIR"
+if [[ $failed -eq 0 ]]; then
+  echo "[INFO] All ${total} tasks finished."
+else
+  echo "[ERROR] Some tasks failed. Check logs under $LOG_DIR"
+  exit 1
+fi

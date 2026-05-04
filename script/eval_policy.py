@@ -493,6 +493,8 @@ def eval_policy(task_name,
     seed_stride = int(args.get("seed_stride", 1))
     task_total_reward = 0
     clear_cache_freq = args["clear_cache_freq"]
+    max_setup_failures = int(args.get("max_setup_failures", 20))
+    consecutive_setup_failures = 0
 
     args["eval_mode"] = True
 
@@ -508,23 +510,41 @@ def eval_policy(task_name,
                 TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
                 episode_info = TASK_ENV.play_once()
                 TASK_ENV.close_env()
+                consecutive_setup_failures = 0
             except UnStableError as e:
                 # print(" -------------")
                 # print("Error: ", e)
                 # print(" -------------")
                 TASK_ENV.close_env()
+                consecutive_setup_failures += 1
+                print(
+                    f"[eval_policy] unstable setup/play_once for task={task_name}, seed={now_seed} "
+                    f"({consecutive_setup_failures}/{max_setup_failures}): {e}"
+                )
                 now_seed += seed_stride
                 args["render_freq"] = render_freq
+                if consecutive_setup_failures >= max_setup_failures:
+                    raise RuntimeError(
+                        f"Exceeded max_setup_failures={max_setup_failures} for task={task_name}. "
+                        f"Latest failing seed={now_seed - seed_stride}."
+                    ) from e
                 continue
             except Exception as e:
-                # stack_trace = traceback.format_exc()
-                # print(" -------------")
-                # print("Error: ", e)
-                # print(" -------------")
                 TASK_ENV.close_env()
+                consecutive_setup_failures += 1
+                print(
+                    f"[eval_policy] error during setup_demo/play_once for task={task_name}, seed={now_seed} "
+                    f"({consecutive_setup_failures}/{max_setup_failures}): {type(e).__name__}: {e}"
+                )
+                traceback.print_exc()
                 now_seed += seed_stride
                 args["render_freq"] = render_freq
                 print("error occurs !")
+                if consecutive_setup_failures >= max_setup_failures:
+                    raise RuntimeError(
+                        f"Exceeded max_setup_failures={max_setup_failures} for task={task_name}. "
+                        f"Latest failing seed={now_seed - seed_stride}."
+                    ) from e
                 continue
 
         if (not expert_check) or (TASK_ENV.plan_success and TASK_ENV.check_success()):

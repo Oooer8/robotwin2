@@ -32,6 +32,9 @@ class ReplayConfig:
     embodiment_dis: float | None
     replay_camera_type: str
     replay_camera_cfg: dict[str, Any]
+    head_camera_type: str
+    head_camera_cfg: dict[str, Any]
+    head_camera_static_info: dict[str, Any] | None
 
 
 class FfmpegVideoWriter:
@@ -108,7 +111,12 @@ def get_embodiment_file(embodiment_type: str, embodiment_types: dict[str, Any]) 
     return resolve_project_path(robot_file)
 
 
-def build_replay_config(task_name: str, task_config_name: str, collection_suffix: str | None = None) -> ReplayConfig:
+def build_replay_config(
+    task_name: str,
+    task_config_name: str,
+    collection_suffix: str | None = None,
+    save_path_override: str | None = None,
+) -> ReplayConfig:
     task_cfg_path = REPO_ROOT / "task_config" / f"{task_config_name}.yml"
     if not task_cfg_path.exists():
         raise FileNotFoundError(f"Task config not found: {task_cfg_path}")
@@ -122,7 +130,8 @@ def build_replay_config(task_name: str, task_config_name: str, collection_suffix
         raise ValueError(f"No embodiment configured in {task_cfg_path}")
 
     collection_folder = collection_suffix if collection_suffix else task_config_name
-    collection_dir = resolve_project_path(task_cfg.get("save_path", "./data")) / task_name / collection_folder
+    save_path = save_path_override if save_path_override is not None else task_cfg.get("save_path", "./data")
+    collection_dir = resolve_project_path(save_path) / task_name / collection_folder
 
     replay_camera_type = task_cfg["camera"]["wrist_camera_type"]
     if replay_camera_type not in camera_types:
@@ -131,6 +140,14 @@ def build_replay_config(task_name: str, task_config_name: str, collection_suffix
     replay_camera_cfg = dict(camera_types[replay_camera_type])
     replay_camera_cfg.setdefault("near", 0.1)
     replay_camera_cfg.setdefault("far", 100.0)
+
+    head_camera_type = task_cfg["camera"]["head_camera_type"]
+    if head_camera_type not in camera_types:
+        raise KeyError(f"Unknown head camera type for replay: {head_camera_type}")
+
+    head_camera_cfg = dict(camera_types[head_camera_type])
+    head_camera_cfg.setdefault("near", 0.1)
+    head_camera_cfg.setdefault("far", 100.0)
 
     if len(embodiment) == 1:
         left_robot_file = get_embodiment_file(embodiment[0], embodiment_types)
@@ -147,6 +164,14 @@ def build_replay_config(task_name: str, task_config_name: str, collection_suffix
 
     left_embodiment_config = load_yaml(left_robot_file / "config.yml")
     right_embodiment_config = load_yaml(right_robot_file / "config.yml")
+    head_camera_static_info = next(
+        (
+            dict(camera_info)
+            for camera_info in left_embodiment_config.get("static_camera_list", [])
+            if camera_info.get("name") == "head_camera"
+        ),
+        None,
+    )
 
     return ReplayConfig(
         task_name=task_name,
@@ -160,11 +185,13 @@ def build_replay_config(task_name: str, task_config_name: str, collection_suffix
         embodiment_dis=embodiment_dis,
         replay_camera_type=replay_camera_type,
         replay_camera_cfg=replay_camera_cfg,
+        head_camera_type=head_camera_type,
+        head_camera_cfg=head_camera_cfg,
+        head_camera_static_info=head_camera_static_info,
     )
 
 
-def get_episode_paths(collection_dir: Path, episode: int | None, all_episodes: bool) -> list[Path]:
-    data_dir = collection_dir / "data"
+def get_episode_paths_from_data_dir(data_dir: Path, episode: int | None, all_episodes: bool) -> list[Path]:
     if not data_dir.exists():
         raise FileNotFoundError(f"Collected episode directory not found: {data_dir}")
 
@@ -184,6 +211,10 @@ def get_episode_paths(collection_dir: Path, episode: int | None, all_episodes: b
     if not episode_path.exists():
         raise FileNotFoundError(f"Episode file not found: {episode_path}")
     return [episode_path]
+
+
+def get_episode_paths(collection_dir: Path, episode: int | None, all_episodes: bool) -> list[Path]:
+    return get_episode_paths_from_data_dir(collection_dir / "data", episode, all_episodes)
 
 
 def load_episode_states(hdf5_path: Path) -> tuple[np.ndarray, int, int]:
@@ -357,6 +388,22 @@ def pose_from_axes(position: np.ndarray, forward: np.ndarray, left: np.ndarray) 
     return sapien.Pose(mat44)
 
 
+def build_pose_matrix(position: np.ndarray, forward: np.ndarray, left: np.ndarray) -> np.ndarray:
+    position = np.asarray(position, dtype=np.float64)
+    forward = np.asarray(forward, dtype=np.float64)
+    left = np.asarray(left, dtype=np.float64)
+
+    forward = forward / np.linalg.norm(forward)
+    left = left / np.linalg.norm(left)
+    up = np.cross(forward, left)
+    up = up / np.linalg.norm(up)
+
+    mat44 = np.eye(4)
+    mat44[:3, :3] = np.stack([forward, left, up], axis=1)
+    mat44[:3, 3] = position
+    return mat44
+
+
 def target_up_to_axes(position: np.ndarray, target: np.ndarray, up_hint: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     position = np.asarray(position, dtype=np.float64)
     target = np.asarray(target, dtype=np.float64)
@@ -439,6 +486,48 @@ def create_render_cameras(
     return cameras
 
 
+def create_pose_camera(
+    scene: Any,
+    name: str,
+    pose_matrix: np.ndarray,
+    camera_cfg: dict[str, Any],
+) -> Any:
+    import sapien.core as sapien
+
+    width = int(camera_cfg["w"])
+    height = int(camera_cfg["h"])
+    fovy = np.deg2rad(float(camera_cfg["fovy"]))
+    near = float(camera_cfg.get("near", 0.1))
+    far = float(camera_cfg.get("far", 100.0))
+
+    camera = scene.add_camera(
+        name=name,
+        width=width,
+        height=height,
+        fovy=fovy,
+        near=near,
+        far=far,
+    )
+    camera.entity.set_pose(sapien.Pose(np.asarray(pose_matrix, dtype=np.float64)))
+    return camera
+
+
+def get_collect_data_head_camera_pose(replay_cfg: ReplayConfig) -> np.ndarray | None:
+    camera_info = replay_cfg.head_camera_static_info
+    if camera_info is None:
+        return None
+
+    position = np.asarray(camera_info["position"], dtype=np.float64)
+    forward = camera_info.get("forward")
+    if forward is None:
+        forward = (-1.0 * position).tolist()
+    left = camera_info.get("left")
+    if left is None:
+        left = [-forward[1], forward[0], 0.0]
+
+    return build_pose_matrix(position, np.asarray(forward, dtype=np.float64), np.asarray(left, dtype=np.float64))
+
+
 def render_camera_rgb(camera: Any) -> np.ndarray:
     camera.take_picture()
     rgba = camera.get_picture("Color")
@@ -446,7 +535,9 @@ def render_camera_rgb(camera: Any) -> np.ndarray:
     return rgb
 
 
-def build_output_dir(collection_dir: Path, episode_idx: int) -> Path:
+def build_output_dir(collection_dir: Path, episode_idx: int, output_root: Path | None = None) -> Path:
+    if output_root is not None:
+        return output_root / f"episode{episode_idx}"
     return collection_dir / "robot_only_replay" / f"episode{episode_idx}"
 
 
@@ -457,14 +548,15 @@ def replay_episode(
     distance_scale: float,
     max_frames: int | None,
     overwrite: bool,
+    output_root: Path | None = None,
 ) -> dict[str, Any]:
     states, left_arm_dim, right_arm_dim = load_episode_states(hdf5_path)
     if max_frames is not None:
         states = states[:max_frames]
 
     episode_idx = int(hdf5_path.stem.replace("episode", ""))
-    output_dir = build_output_dir(replay_cfg.collection_dir, episode_idx)
-    view_paths = {view: output_dir / f"{view}.mp4" for view in ("front", "side", "top")}
+    output_dir = build_output_dir(replay_cfg.collection_dir, episode_idx, output_root)
+    view_paths = {view: output_dir / f"{view}.mp4" for view in ("front", "side", "top", "head")}
     manifest_path = output_dir / "manifest.json"
 
     if not overwrite and all(path.exists() for path in view_paths.values()) and manifest_path.exists():
@@ -494,10 +586,30 @@ def replay_episode(
 
     camera_setup = estimate_camera_setup(robot, distance_scale)
     cameras = create_render_cameras(scene, camera_setup, replay_cfg.replay_camera_cfg)
+    head_camera_pose = get_collect_data_head_camera_pose(replay_cfg)
+    head_camera_pose_source = "embodiment_static_camera_list"
+    if head_camera_pose is None:
+        raise ValueError(
+            f"Unable to resolve head camera pose for {hdf5_path}: "
+            "missing head_camera in embodiment static_camera_list"
+        )
+    cameras["head"] = create_pose_camera(
+        scene,
+        name="robot_only_head",
+        pose_matrix=head_camera_pose,
+        camera_cfg=replay_cfg.head_camera_cfg,
+    )
 
-    video_width = int(replay_cfg.replay_camera_cfg["w"])
-    video_height = int(replay_cfg.replay_camera_cfg["h"])
-    writers = {view: FfmpegVideoWriter(path, video_width, video_height, fps) for view, path in view_paths.items()}
+    view_camera_cfgs = {
+        "front": replay_cfg.replay_camera_cfg,
+        "side": replay_cfg.replay_camera_cfg,
+        "top": replay_cfg.replay_camera_cfg,
+        "head": replay_cfg.head_camera_cfg,
+    }
+    writers = {
+        view: FfmpegVideoWriter(path, int(view_camera_cfgs[view]["w"]), int(view_camera_cfgs[view]["h"]), fps)
+        for view, path in view_paths.items()
+    }
 
     try:
         for state in states:
@@ -533,6 +645,14 @@ def replay_episode(
             "near": float(replay_cfg.replay_camera_cfg.get("near", 0.1)),
             "far": float(replay_cfg.replay_camera_cfg.get("far", 100.0)),
         },
+        "head_camera_model": {
+            "type": replay_cfg.head_camera_type,
+            "width": int(replay_cfg.head_camera_cfg["w"]),
+            "height": int(replay_cfg.head_camera_cfg["h"]),
+            "fovy_deg": float(replay_cfg.head_camera_cfg["fovy"]),
+            "near": float(replay_cfg.head_camera_cfg.get("near", 0.1)),
+            "far": float(replay_cfg.head_camera_cfg.get("far", 100.0)),
+        },
         "views": {view: str(path.resolve()) for view, path in view_paths.items()},
         "camera_setup": {
             view: {
@@ -540,6 +660,8 @@ def replay_episode(
             }
             for view, spec in camera_setup.items()
         },
+        "head_camera_pose_source": head_camera_pose_source,
+        "head_camera_pose": head_camera_pose.tolist(),
     }
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
@@ -556,7 +678,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Render robot-only replay videos from RobotWin2 collected joint trajectories."
     )
-    parser.add_argument("--task-name", required=True, help="Task name, e.g. beat_block_hammer")
+    parser.add_argument(
+        "--task-name",
+        help="Task name, e.g. beat_block_hammer. Optional when --data-dir is provided.",
+    )
     parser.add_argument("--task-config", required=True, help="Task config name without .yml, e.g. demo_clean")
     parser.add_argument("--episode", type=int, help="Single episode index to render")
     parser.add_argument(
@@ -580,13 +705,42 @@ def parse_args() -> argparse.Namespace:
             "will read from <save_path>/<task>/<collection-suffix> "
             "instead of <save_path>/<task>/<task-config>",
     )
+    parser.add_argument(
+        "--save-path",
+        default=None,
+        help="Override save_path from task_config/<task-config>.yml. "
+            "It should be the parent directory containing task folders.",
+    )
+    parser.add_argument(
+        "--data-dir",
+        default=None,
+        help="Directly read episode*.hdf5 from this directory instead of "
+            "<save_path>/<task-name>/<collection-suffix>/data.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Output root for replay videos. Defaults to <collection-dir>/robot_only_replay "
+            "or <data-dir>/robot_only_replay in --data-dir mode.",
+    )
 
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    replay_cfg = build_replay_config(args.task_name, args.task_config, args.collection_suffix)
+    direct_data_dir = Path(args.data_dir).expanduser().resolve() if args.data_dir else None
+    task_name = args.task_name
+    if task_name is None:
+        if direct_data_dir is None:
+            raise ValueError("--task-name is required unless --data-dir is provided")
+        task_name = direct_data_dir.name
+
+    replay_cfg = build_replay_config(task_name, args.task_config, args.collection_suffix, args.save_path)
+    if direct_data_dir is not None:
+        if not direct_data_dir.is_dir():
+            raise FileNotFoundError(f"--data-dir does not exist or is not a directory: {direct_data_dir}")
+        replay_cfg.collection_dir = direct_data_dir
 
 
     for path in [replay_cfg.left_robot_file, replay_cfg.right_robot_file]:
@@ -595,7 +749,12 @@ def main() -> None:
                 f"Robot embodiment assets not found: {path}. Please download/install the assets first."
             )
 
-    episode_paths = get_episode_paths(replay_cfg.collection_dir, args.episode, args.all_episodes)
+    if direct_data_dir is not None:
+        episode_paths = get_episode_paths_from_data_dir(direct_data_dir, args.episode, args.all_episodes)
+    else:
+        episode_paths = get_episode_paths(replay_cfg.collection_dir, args.episode, args.all_episodes)
+
+    output_root = Path(args.output_dir).expanduser().resolve() if args.output_dir else None
     results = []
     for hdf5_path in episode_paths:
         result = replay_episode(
@@ -605,6 +764,7 @@ def main() -> None:
             distance_scale=args.distance_scale,
             max_frames=args.max_frames,
             overwrite=args.overwrite,
+            output_root=output_root,
         )
         results.append(result)
         print(json.dumps(result, ensure_ascii=False))
@@ -613,10 +773,11 @@ def main() -> None:
         json.dumps(
             {
                 "task_name": args.task_name,
+                "resolved_task_name": task_name,
                 "task_config": args.task_config,
                 "episodes": len(results),
                 "collection_dir": str(replay_cfg.collection_dir.resolve()),
-                "replay_dir": str((replay_cfg.collection_dir / "robot_only_replay").resolve()),
+                "replay_dir": str((output_root or (replay_cfg.collection_dir / "robot_only_replay")).resolve()),
             },
             ensure_ascii=False,
         )
