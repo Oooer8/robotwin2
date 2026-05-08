@@ -21,6 +21,7 @@ from envs._GLOBAL_CONFIGS import CONFIGS_PATH  # noqa: E402
 
 
 VALID_REPLAY_VIEWS = ("front", "side", "top", "head")
+VALID_STATE_LAYOUTS = ("auto", "qpos", "endpose")
 
 
 @dataclass
@@ -296,6 +297,45 @@ def validate_states(states: np.ndarray, episode_path: Path) -> np.ndarray:
     return states.astype(np.float64)
 
 
+def looks_like_endpose_states(states: np.ndarray) -> bool:
+    if states.ndim != 2 or states.shape[1] != 16:
+        return False
+
+    left_quat_norm = np.linalg.norm(states[:, 3:7], axis=1)
+    right_quat_norm = np.linalg.norm(states[:, 11:15], axis=1)
+    quat_like = (
+        np.nanmedian(np.abs(left_quat_norm - 1.0)) < 0.08
+        and np.nanmedian(np.abs(right_quat_norm - 1.0)) < 0.08
+    )
+    gripper_like = (
+        np.nanmean((states[:, 7] >= -0.05) & (states[:, 7] <= 1.05)) > 0.9
+        and np.nanmean((states[:, 15] >= -0.05) & (states[:, 15] <= 1.05)) > 0.9
+    )
+    position_like = (
+        np.nanpercentile(np.abs(states[:, :3]), 95) < 3.0
+        and np.nanpercentile(np.abs(states[:, 8:11]), 95) < 3.0
+    )
+    return bool(quat_like and gripper_like and position_like)
+
+
+def validate_npy_state_layout(states: np.ndarray, npy_path: Path, state_layout: str) -> str:
+    if state_layout not in VALID_STATE_LAYOUTS:
+        valid = ", ".join(VALID_STATE_LAYOUTS)
+        raise ValueError(f"Unsupported --state-layout {state_layout!r}. Valid layouts: {valid}")
+
+    detected_endpose = looks_like_endpose_states(states)
+    if state_layout == "endpose" or (state_layout == "auto" and detected_endpose):
+        raise ValueError(
+            f"{npy_path} looks like 16-D end-effector pose state "
+            "[left_xyz, left_quat, left_gripper, right_xyz, right_quat, right_gripper], "
+            "not joint qpos. Robot-only replay needs joint qpos to set the URDF joints exactly. "
+            "Use the original RoboTwin episode*.hdf5 /joint_action data, or pass a qpos npy with "
+            "--state-layout qpos. Endpose-only replay would require IK and is not exact."
+        )
+
+    return "qpos"
+
+
 def load_hdf5_episode_states(hdf5_path: Path) -> tuple[np.ndarray, int, int]:
     import h5py
 
@@ -326,9 +366,11 @@ def load_npy_episode_states(
     npy_path: Path,
     left_arm_dim: int | None = None,
     right_arm_dim: int | None = None,
+    state_layout: str = "auto",
 ) -> tuple[np.ndarray, int, int]:
     states = np.load(npy_path, allow_pickle=False)
     states = validate_states(states, npy_path)
+    validate_npy_state_layout(states, npy_path, state_layout)
     inferred_left_dim, inferred_right_dim = infer_arm_dims_from_state_dim(
         int(states.shape[1]),
         left_arm_dim=left_arm_dim,
@@ -341,12 +383,13 @@ def load_episode_states(
     episode_path: Path,
     left_arm_dim: int | None = None,
     right_arm_dim: int | None = None,
+    state_layout: str = "auto",
 ) -> tuple[np.ndarray, int, int]:
     suffix = episode_path.suffix.lower()
     if suffix in {".hdf5", ".h5"}:
         return load_hdf5_episode_states(episode_path)
     if suffix == ".npy":
-        return load_npy_episode_states(episode_path, left_arm_dim, right_arm_dim)
+        return load_npy_episode_states(episode_path, left_arm_dim, right_arm_dim, state_layout)
     raise ValueError(f"Unsupported episode file type: {episode_path}")
 
 
@@ -674,11 +717,13 @@ def replay_episode(
     left_arm_dim_override: int | None = None,
     right_arm_dim_override: int | None = None,
     views: tuple[str, ...] = VALID_REPLAY_VIEWS,
+    state_layout: str = "auto",
 ) -> dict[str, Any]:
     states, left_arm_dim, right_arm_dim = load_episode_states(
         episode_path,
         left_arm_dim=left_arm_dim_override,
         right_arm_dim=right_arm_dim_override,
+        state_layout=state_layout,
     )
     if max_frames is not None:
         states = states[:max_frames]
@@ -869,7 +914,7 @@ def parse_args() -> argparse.Namespace:
         "--states-dir",
         default=None,
         help="Directly read episode*.npy state files from this directory. "
-            "State rows are interpreted as [left_arm, left_gripper, right_arm, right_gripper].",
+            "For robot-only replay these must be joint qpos rows.",
     )
     parser.add_argument(
         "--state-file",
@@ -887,6 +932,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Right arm joint dimension for .npy states. Defaults to inferring evenly from state_dim - 2.",
+    )
+    parser.add_argument(
+        "--state-layout",
+        choices=VALID_STATE_LAYOUTS,
+        default="auto",
+        help="Layout for .npy states. auto refuses likely endpose states; qpos treats rows as joint qpos.",
     )
     parser.add_argument(
         "--output-dir",
@@ -978,6 +1029,7 @@ def main() -> None:
             left_arm_dim_override=args.left_arm_dim,
             right_arm_dim_override=args.right_arm_dim,
             views=views,
+            state_layout=args.state_layout,
         )
         results.append(result)
         print(json.dumps(result, ensure_ascii=False))

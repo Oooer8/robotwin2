@@ -25,8 +25,8 @@
 #     --max-frames 30 --overwrite
 #
 # Notes:
-#   - .npy rows are interpreted as [left_arm, left_gripper, right_arm, right_gripper].
-#   - For a 16-D state this defaults to left_arm_dim=7 and right_arm_dim=7.
+#   - .npy rows must be joint qpos: [left_arm, left_gripper, right_arm, right_gripper].
+#   - 16-D endpose states are detected and rejected because they cannot exactly set URDF joints.
 #   - This wrapper renders the robot-only three-view set: front, side, top.
 #     Pass --views front,side,top,head in extra args if you also want head.mp4.
 #   - Pass --left-arm-dim/--right-arm-dim in extra args if your state layout differs.
