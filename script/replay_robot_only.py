@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -17,6 +18,9 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
 from envs._GLOBAL_CONFIGS import CONFIGS_PATH  # noqa: E402
+
+
+VALID_REPLAY_VIEWS = ("front", "side", "top", "head")
 
 
 @dataclass
@@ -191,33 +195,108 @@ def build_replay_config(
     )
 
 
-def get_episode_paths_from_data_dir(data_dir: Path, episode: int | None, all_episodes: bool) -> list[Path]:
-    if not data_dir.exists():
-        raise FileNotFoundError(f"Collected episode directory not found: {data_dir}")
+def episode_index_from_path(path: Path) -> int:
+    match = re.search(r"episode(\d+)", path.stem)
+    if match is None:
+        raise ValueError(f"Unable to parse episode index from {path.name}")
+    return int(match.group(1))
+
+
+def sort_episode_paths(paths: list[Path]) -> list[Path]:
+    return sorted(paths, key=episode_index_from_path)
+
+
+def get_episode_paths_from_flat_dir(
+    source_dir: Path,
+    episode: int | None,
+    all_episodes: bool,
+    suffix: str,
+    description: str,
+) -> list[Path]:
+    if not source_dir.exists():
+        raise FileNotFoundError(f"{description} directory not found: {source_dir}")
 
     if all_episodes:
-        episode_paths = sorted(
-            data_dir.glob("episode*.hdf5"),
-            key=lambda path: int(path.stem.replace("episode", "")),
-        )
+        episode_paths = sort_episode_paths(list(source_dir.glob(f"episode*{suffix}")))
         if not episode_paths:
-            raise FileNotFoundError(f"No episode*.hdf5 files found in {data_dir}")
+            raise FileNotFoundError(f"No episode*{suffix} files found in {source_dir}")
         return episode_paths
 
     if episode is None:
         raise ValueError("Either --episode or --all-episodes must be provided")
 
-    episode_path = data_dir / f"episode{episode}.hdf5"
+    episode_path = source_dir / f"episode{episode}{suffix}"
     if not episode_path.exists():
         raise FileNotFoundError(f"Episode file not found: {episode_path}")
     return [episode_path]
+
+
+def get_episode_paths_from_data_dir(data_dir: Path, episode: int | None, all_episodes: bool) -> list[Path]:
+    return get_episode_paths_from_flat_dir(data_dir, episode, all_episodes, ".hdf5", "Collected episode")
+
+
+def get_episode_paths_from_states_dir(states_dir: Path, episode: int | None, all_episodes: bool) -> list[Path]:
+    return get_episode_paths_from_flat_dir(states_dir, episode, all_episodes, ".npy", "State episode")
 
 
 def get_episode_paths(collection_dir: Path, episode: int | None, all_episodes: bool) -> list[Path]:
     return get_episode_paths_from_data_dir(collection_dir / "data", episode, all_episodes)
 
 
-def load_episode_states(hdf5_path: Path) -> tuple[np.ndarray, int, int]:
+def infer_arm_dims_from_state_dim(
+    state_dim: int,
+    left_arm_dim: int | None = None,
+    right_arm_dim: int | None = None,
+) -> tuple[int, int]:
+    if left_arm_dim is not None and left_arm_dim <= 0:
+        raise ValueError(f"--left-arm-dim must be positive, got {left_arm_dim}")
+    if right_arm_dim is not None and right_arm_dim <= 0:
+        raise ValueError(f"--right-arm-dim must be positive, got {right_arm_dim}")
+
+    if left_arm_dim is not None and right_arm_dim is not None:
+        expected_dim = left_arm_dim + right_arm_dim + 2
+        if state_dim != expected_dim:
+            raise ValueError(
+                f"State dimension mismatch: got {state_dim}, expected {expected_dim} "
+                f"from left_arm_dim={left_arm_dim}, right_arm_dim={right_arm_dim}"
+            )
+        return left_arm_dim, right_arm_dim
+
+    if left_arm_dim is not None:
+        inferred_right = state_dim - left_arm_dim - 2
+        if inferred_right <= 0:
+            raise ValueError(
+                f"Cannot infer right arm dim from state_dim={state_dim}, left_arm_dim={left_arm_dim}"
+            )
+        return left_arm_dim, inferred_right
+
+    if right_arm_dim is not None:
+        inferred_left = state_dim - right_arm_dim - 2
+        if inferred_left <= 0:
+            raise ValueError(
+                f"Cannot infer left arm dim from state_dim={state_dim}, right_arm_dim={right_arm_dim}"
+            )
+        return inferred_left, right_arm_dim
+
+    arm_total_dim = state_dim - 2
+    if arm_total_dim <= 0 or arm_total_dim % 2 != 0:
+        raise ValueError(
+            f"Cannot infer arm dims from state_dim={state_dim}. "
+            "Expected [left_arm, left_gripper, right_arm, right_gripper]; "
+            "pass --left-arm-dim and --right-arm-dim explicitly."
+        )
+
+    arm_dim = arm_total_dim // 2
+    return arm_dim, arm_dim
+
+
+def validate_states(states: np.ndarray, episode_path: Path) -> np.ndarray:
+    if states.ndim != 2 or states.shape[0] == 0:
+        raise ValueError(f"Episode {episode_path} does not contain valid 2D joint states")
+    return states.astype(np.float64)
+
+
+def load_hdf5_episode_states(hdf5_path: Path) -> tuple[np.ndarray, int, int]:
     import h5py
 
     with h5py.File(hdf5_path, "r") as root:
@@ -239,10 +318,36 @@ def load_episode_states(hdf5_path: Path) -> tuple[np.ndarray, int, int]:
                 axis=1,
             )
 
-    if states.ndim != 2 or states.shape[0] == 0:
-        raise ValueError(f"Episode {hdf5_path} does not contain valid joint states")
+    states = validate_states(states, hdf5_path)
+    return states, int(left_arm.shape[1]), int(right_arm.shape[1])
 
-    return states.astype(np.float64), int(left_arm.shape[1]), int(right_arm.shape[1])
+
+def load_npy_episode_states(
+    npy_path: Path,
+    left_arm_dim: int | None = None,
+    right_arm_dim: int | None = None,
+) -> tuple[np.ndarray, int, int]:
+    states = np.load(npy_path, allow_pickle=False)
+    states = validate_states(states, npy_path)
+    inferred_left_dim, inferred_right_dim = infer_arm_dims_from_state_dim(
+        int(states.shape[1]),
+        left_arm_dim=left_arm_dim,
+        right_arm_dim=right_arm_dim,
+    )
+    return states, inferred_left_dim, inferred_right_dim
+
+
+def load_episode_states(
+    episode_path: Path,
+    left_arm_dim: int | None = None,
+    right_arm_dim: int | None = None,
+) -> tuple[np.ndarray, int, int]:
+    suffix = episode_path.suffix.lower()
+    if suffix in {".hdf5", ".h5"}:
+        return load_hdf5_episode_states(episode_path)
+    if suffix == ".npy":
+        return load_npy_episode_states(episode_path, left_arm_dim, right_arm_dim)
+    raise ValueError(f"Unsupported episode file type: {episode_path}")
 
 
 def create_scene() -> tuple[Any, Any, Any]:
@@ -512,6 +617,23 @@ def create_pose_camera(
     return camera
 
 
+def parse_views(raw_views: str) -> tuple[str, ...]:
+    views = tuple(view.strip() for view in raw_views.replace(",", " ").split() if view.strip())
+    if not views:
+        raise ValueError("--views must contain at least one view")
+
+    invalid_views = sorted(set(views) - set(VALID_REPLAY_VIEWS))
+    if invalid_views:
+        valid = ", ".join(VALID_REPLAY_VIEWS)
+        raise ValueError(f"Unsupported replay views: {', '.join(invalid_views)}. Valid views: {valid}")
+
+    deduped_views = []
+    for view in views:
+        if view not in deduped_views:
+            deduped_views.append(view)
+    return tuple(deduped_views)
+
+
 def get_collect_data_head_camera_pose(replay_cfg: ReplayConfig) -> np.ndarray | None:
     camera_info = replay_cfg.head_camera_static_info
     if camera_info is None:
@@ -543,20 +665,27 @@ def build_output_dir(collection_dir: Path, episode_idx: int, output_root: Path |
 
 def replay_episode(
     replay_cfg: ReplayConfig,
-    hdf5_path: Path,
+    episode_path: Path,
     fps: float,
     distance_scale: float,
     max_frames: int | None,
     overwrite: bool,
     output_root: Path | None = None,
+    left_arm_dim_override: int | None = None,
+    right_arm_dim_override: int | None = None,
+    views: tuple[str, ...] = VALID_REPLAY_VIEWS,
 ) -> dict[str, Any]:
-    states, left_arm_dim, right_arm_dim = load_episode_states(hdf5_path)
+    states, left_arm_dim, right_arm_dim = load_episode_states(
+        episode_path,
+        left_arm_dim=left_arm_dim_override,
+        right_arm_dim=right_arm_dim_override,
+    )
     if max_frames is not None:
         states = states[:max_frames]
 
-    episode_idx = int(hdf5_path.stem.replace("episode", ""))
+    episode_idx = episode_index_from_path(episode_path)
     output_dir = build_output_dir(replay_cfg.collection_dir, episode_idx, output_root)
-    view_paths = {view: output_dir / f"{view}.mp4" for view in ("front", "side", "top", "head")}
+    view_paths = {view: output_dir / f"{view}.mp4" for view in views}
     manifest_path = output_dir / "manifest.json"
 
     if not overwrite and all(path.exists() for path in view_paths.values()) and manifest_path.exists():
@@ -585,20 +714,29 @@ def replay_episode(
     scene.update_render()
 
     camera_setup = estimate_camera_setup(robot, distance_scale)
-    cameras = create_render_cameras(scene, camera_setup, replay_cfg.replay_camera_cfg)
-    head_camera_pose = get_collect_data_head_camera_pose(replay_cfg)
-    head_camera_pose_source = "embodiment_static_camera_list"
-    if head_camera_pose is None:
-        raise ValueError(
-            f"Unable to resolve head camera pose for {hdf5_path}: "
-            "missing head_camera in embodiment static_camera_list"
+    selected_camera_setup = {
+        view: camera_setup[view]
+        for view in views
+        if view in camera_setup
+    }
+    cameras = create_render_cameras(scene, selected_camera_setup, replay_cfg.replay_camera_cfg)
+
+    head_camera_pose = None
+    head_camera_pose_source = None
+    if "head" in views:
+        head_camera_pose = get_collect_data_head_camera_pose(replay_cfg)
+        head_camera_pose_source = "embodiment_static_camera_list"
+        if head_camera_pose is None:
+            raise ValueError(
+                f"Unable to resolve head camera pose for {episode_path}: "
+                "missing head_camera in embodiment static_camera_list"
+            )
+        cameras["head"] = create_pose_camera(
+            scene,
+            name="robot_only_head",
+            pose_matrix=head_camera_pose,
+            camera_cfg=replay_cfg.head_camera_cfg,
         )
-    cameras["head"] = create_pose_camera(
-        scene,
-        name="robot_only_head",
-        pose_matrix=head_camera_pose,
-        camera_cfg=replay_cfg.head_camera_cfg,
-    )
 
     view_camera_cfgs = {
         "front": replay_cfg.replay_camera_cfg,
@@ -634,9 +772,14 @@ def replay_episode(
         "task_name": replay_cfg.task_name,
         "task_config": replay_cfg.task_config_name,
         "episode": episode_idx,
-        "source_hdf5": str(hdf5_path.resolve()),
+        "source_path": str(episode_path.resolve()),
+        "source_type": episode_path.suffix.lower().lstrip("."),
         "frames": int(states.shape[0]),
         "fps": fps,
+        "state_shape": [int(dim) for dim in states.shape],
+        "left_arm_dim": int(left_arm_dim),
+        "right_arm_dim": int(right_arm_dim),
+        "rendered_views": list(views),
         "camera_model": {
             "type": replay_cfg.replay_camera_type,
             "width": int(replay_cfg.replay_camera_cfg["w"]),
@@ -658,10 +801,10 @@ def replay_episode(
             view: {
                 key: value.tolist() for key, value in spec.items()
             }
-            for view, spec in camera_setup.items()
+            for view, spec in selected_camera_setup.items()
         },
         "head_camera_pose_source": head_camera_pose_source,
-        "head_camera_pose": head_camera_pose.tolist(),
+        "head_camera_pose": head_camera_pose.tolist() if head_camera_pose is not None else None,
     }
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
@@ -680,16 +823,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--task-name",
-        help="Task name, e.g. beat_block_hammer. Optional when --data-dir is provided.",
+        help="Task name, e.g. beat_block_hammer. Optional when a direct source dir/file is provided.",
     )
     parser.add_argument("--task-config", required=True, help="Task config name without .yml, e.g. demo_clean")
     parser.add_argument("--episode", type=int, help="Single episode index to render")
     parser.add_argument(
         "--all-episodes",
         action="store_true",
-        help="Render every episode under the collected data directory",
+        help="Render every episode under the selected HDF5 data directory or NPY states directory",
     )
     parser.add_argument("--fps", type=float, default=30.0, help="Output video FPS")
+    parser.add_argument(
+        "--views",
+        default="front,side,top,head",
+        help="Replay views to render, comma- or space-separated. Valid views: front, side, top, head.",
+    )
     parser.add_argument(
         "--distance-scale",
         type=float,
@@ -718,30 +866,80 @@ def parse_args() -> argparse.Namespace:
             "<save_path>/<task-name>/<collection-suffix>/data.",
     )
     parser.add_argument(
+        "--states-dir",
+        default=None,
+        help="Directly read episode*.npy state files from this directory. "
+            "State rows are interpreted as [left_arm, left_gripper, right_arm, right_gripper].",
+    )
+    parser.add_argument(
+        "--state-file",
+        default=None,
+        help="Render a single episode*.npy state file.",
+    )
+    parser.add_argument(
+        "--left-arm-dim",
+        type=int,
+        default=None,
+        help="Left arm joint dimension for .npy states. Defaults to inferring evenly from state_dim - 2.",
+    )
+    parser.add_argument(
+        "--right-arm-dim",
+        type=int,
+        default=None,
+        help="Right arm joint dimension for .npy states. Defaults to inferring evenly from state_dim - 2.",
+    )
+    parser.add_argument(
         "--output-dir",
         default=None,
         help="Output root for replay videos. Defaults to <collection-dir>/robot_only_replay "
-            "or <data-dir>/robot_only_replay in --data-dir mode.",
+            "or <data-dir>/robot_only_replay in --data-dir mode. For dataset/states/<task>, "
+            "the default is dataset/robot_only_replay/<task>.",
     )
 
     return parser.parse_args()
 
 
+def default_states_output_root(state_source: Path) -> Path:
+    states_dir = state_source.parent if state_source.suffix.lower() == ".npy" else state_source
+    if states_dir.parent.name == "states":
+        return states_dir.parent.parent / "robot_only_replay" / states_dir.name
+    return states_dir / "robot_only_replay"
+
+
 def main() -> None:
     args = parse_args()
+    views = parse_views(args.views)
     direct_data_dir = Path(args.data_dir).expanduser().resolve() if args.data_dir else None
+    states_dir = Path(args.states_dir).expanduser().resolve() if args.states_dir else None
+    state_file = Path(args.state_file).expanduser().resolve() if args.state_file else None
+    source_mode_count = sum(source is not None for source in (direct_data_dir, states_dir, state_file))
+    if source_mode_count > 1:
+        raise ValueError("Use only one of --data-dir, --states-dir, or --state-file")
+    if state_file is not None and not state_file.is_file():
+        raise FileNotFoundError(f"--state-file does not exist or is not a file: {state_file}")
+
     task_name = args.task_name
     if task_name is None:
-        if direct_data_dir is None:
-            raise ValueError("--task-name is required unless --data-dir is provided")
-        task_name = direct_data_dir.name
+        if direct_data_dir is not None:
+            task_name = direct_data_dir.name
+        elif states_dir is not None:
+            task_name = states_dir.name
+        elif state_file is not None:
+            task_name = state_file.parent.name
+        else:
+            raise ValueError("--task-name is required unless --data-dir, --states-dir, or --state-file is provided")
 
     replay_cfg = build_replay_config(task_name, args.task_config, args.collection_suffix, args.save_path)
     if direct_data_dir is not None:
         if not direct_data_dir.is_dir():
             raise FileNotFoundError(f"--data-dir does not exist or is not a directory: {direct_data_dir}")
         replay_cfg.collection_dir = direct_data_dir
-
+    elif states_dir is not None:
+        if not states_dir.is_dir():
+            raise FileNotFoundError(f"--states-dir does not exist or is not a directory: {states_dir}")
+        replay_cfg.collection_dir = states_dir
+    elif state_file is not None:
+        replay_cfg.collection_dir = state_file.parent
 
     for path in [replay_cfg.left_robot_file, replay_cfg.right_robot_file]:
         if not path.exists():
@@ -751,20 +949,35 @@ def main() -> None:
 
     if direct_data_dir is not None:
         episode_paths = get_episode_paths_from_data_dir(direct_data_dir, args.episode, args.all_episodes)
+    elif states_dir is not None:
+        episode_paths = get_episode_paths_from_states_dir(states_dir, args.episode, args.all_episodes)
+    elif state_file is not None:
+        episode_paths = [state_file]
     else:
         episode_paths = get_episode_paths(replay_cfg.collection_dir, args.episode, args.all_episodes)
 
-    output_root = Path(args.output_dir).expanduser().resolve() if args.output_dir else None
+    if args.output_dir:
+        output_root = Path(args.output_dir).expanduser().resolve()
+    elif states_dir is not None:
+        output_root = default_states_output_root(states_dir)
+    elif state_file is not None:
+        output_root = default_states_output_root(state_file)
+    else:
+        output_root = None
+
     results = []
-    for hdf5_path in episode_paths:
+    for episode_path in episode_paths:
         result = replay_episode(
             replay_cfg=replay_cfg,
-            hdf5_path=hdf5_path,
+            episode_path=episode_path,
             fps=args.fps,
             distance_scale=args.distance_scale,
             max_frames=args.max_frames,
             overwrite=args.overwrite,
             output_root=output_root,
+            left_arm_dim_override=args.left_arm_dim,
+            right_arm_dim_override=args.right_arm_dim,
+            views=views,
         )
         results.append(result)
         print(json.dumps(result, ensure_ascii=False))
@@ -776,6 +989,7 @@ def main() -> None:
                 "resolved_task_name": task_name,
                 "task_config": args.task_config,
                 "episodes": len(results),
+                "views": list(views),
                 "collection_dir": str(replay_cfg.collection_dir.resolve()),
                 "replay_dir": str((output_root or (replay_cfg.collection_dir / "robot_only_replay")).resolve()),
             },
