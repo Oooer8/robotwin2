@@ -952,7 +952,7 @@ def parse_args() -> argparse.Namespace:
 
 def default_states_output_root(state_source: Path) -> Path:
     states_dir = state_source.parent if state_source.suffix.lower() == ".npy" else state_source
-    if states_dir.parent.name == "states":
+    if states_dir.parent.name in {"states", "actions"}:
         return states_dir.parent.parent / "robot_only_replay" / states_dir.name
     return states_dir / "robot_only_replay"
 

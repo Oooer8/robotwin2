@@ -2,24 +2,24 @@
 # ============================================================
 # replay_robot_only_states_episodes.sh
 #
-# Parallel robot-only replay across episode*.npy files in a flat states directory.
+# Parallel robot-only replay across episode*.npy files in a flat qpos/actions directory.
 #
 # Expected data layout:
-#   <dataset_root>/states/<task_or_split>/episode*.npy
+#   <dataset_root>/{actions,states}/<task_or_split>/episode*.npy
 #
 # Default output layout:
 #   <dataset_root>/robot_only_replay/<task_or_split>/episodeN/{front,side,top}.mp4
 #
 # Usage:
-#   bash replay_robot_only_states_episodes.sh <states_dir> [task_config] [num_gpus] [output_dir] [extra replay args...]
+#   bash replay_robot_only_states_episodes.sh <qpos_npy_dir> [task_config] [num_gpus] [output_dir] [extra replay args...]
 #
 # Examples:
 #   bash replay_robot_only_states_episodes.sh \
-#     /root/workspace/final/dataset/WorldArena_track2/data/dataset/states/fixed_scene_task \
+#     /root/workspace/final/dataset/WorldArena_track2/data/dataset/actions/fixed_scene_task \
 #     wm_agilex_100 8 "" --overwrite
 #
 #   bash replay_robot_only_states_episodes.sh \
-#     /root/workspace/final/dataset/WorldArena_track2/data/dataset/states/fixed_scene_task \
+#     /root/workspace/final/dataset/WorldArena_track2/data/dataset/actions/fixed_scene_task \
 #     wm_agilex_100 8 \
 #     /root/workspace/final/dataset/WorldArena_track2/data/dataset/robot_only_replay/fixed_scene_task \
 #     --max-frames 30 --overwrite
@@ -44,8 +44,8 @@ python_bin="${PYTHON:-python}"
 overwrite_arg=()
 
 if [[ -z "$states_dir" ]]; then
-  echo "Usage: bash $0 <states_dir> [task_config] [num_gpus] [output_dir] [extra replay args...]"
-  echo "Example: bash $0 /path/to/dataset/states/fixed_scene_task wm_agilex_100 8 \"\" --overwrite"
+  echo "Usage: bash $0 <qpos_npy_dir> [task_config] [num_gpus] [output_dir] [extra replay args...]"
+  echo "Example: bash $0 /path/to/dataset/actions/fixed_scene_task wm_agilex_100 8 \"\" --overwrite"
   exit 1
 fi
 
@@ -119,20 +119,28 @@ PY
 LOG_DIR="logs/replay_states/$(basename "$states_dir_abs")_${task_config}_episodes"
 mkdir -p "$LOG_DIR"
 
-output_dir_arg=()
 if [[ -n "$output_dir" ]]; then
-  output_dir_arg=(--output-dir "$output_dir")
+  output_dir_effective="$output_dir"
+else
+  output_dir_effective="$("$python_bin" - "$states_dir_abs" <<'PY'
+import sys
+from pathlib import Path
+
+input_dir = Path(sys.argv[1]).expanduser().resolve()
+if input_dir.parent.name in {"actions", "states"}:
+    print(input_dir.parent.parent / "robot_only_replay" / input_dir.name)
+else:
+    print(input_dir / "robot_only_replay")
+PY
+)"
 fi
+output_dir_arg=(--output-dir "$output_dir_effective")
 
 echo "[INFO] states_dir=$states_dir_abs"
 echo "[INFO] task_config=$task_config"
 echo "[INFO] num_gpus=$num_gpus"
 echo "[INFO] episodes=$total"
-if [[ -n "$output_dir" ]]; then
-  echo "[INFO] output_dir=$output_dir"
-else
-  echo "[INFO] output_dir=auto (dataset/robot_only_replay/<task> when states_dir is dataset/states/<task>)"
-fi
+echo "[INFO] output_dir=$output_dir_effective"
 echo "[INFO] logs=$LOG_DIR"
 
 next_idx=0
