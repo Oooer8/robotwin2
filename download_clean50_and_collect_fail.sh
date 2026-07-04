@@ -103,14 +103,14 @@ GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
 
 command -v unzip >/dev/null 2>&1 || { echo -e "${RED}[ERROR]${NC} 需要 unzip, 请先安装 (apt-get install -y unzip)"; exit 1; }
 
-# huggingface-cli 兼容 (新版本可能是 `hf download`)
-HF_DL=()
-if command -v huggingface-cli >/dev/null 2>&1; then
-  HF_DL=(huggingface-cli download)
-elif command -v hf >/dev/null 2>&1; then
-  HF_DL=(hf download)
+# HF CLI 兼容: 新版 huggingface_hub(1.x) 用 `hf`, 旧版用 `huggingface-cli`。
+# 优先使用 `hf`, 因为新版里 `huggingface-cli` 已弃用为只打印提示的壳。
+if command -v hf >/dev/null 2>&1; then
+  HF_CLI_BIN="hf"
+elif command -v huggingface-cli >/dev/null 2>&1; then
+  HF_CLI_BIN="huggingface-cli"
 else
-  echo -e "${RED}[ERROR]${NC} 未找到 huggingface-cli, 请先安装: pip install -U 'huggingface_hub[cli]'"
+  echo -e "${RED}[ERROR]${NC} 未找到 hf / huggingface-cli, 请先安装: pip install -U 'huggingface_hub[cli]'"
   exit 1
 fi
 
@@ -129,14 +129,14 @@ prepare_one() {
     return 0
   fi
 
-  # 下载 (仅这一个文件)
+  # 下载 (仅这一个文件, 用位置参数指定文件路径, 跨版本最稳妥)
   if [ ! -f "$zip_path" ]; then
     echo -e "${YELLOW}[DL]${NC}    ${task}/${CONFIG_ZIP}"
-    "$HF_CLI_BIN" download "$REPO" --repo-type dataset \
-      --include "$zip_rel" --local-dir "$RAW_ROOT" >/dev/null
+    "$HF_CLI_BIN" download "$REPO" "$zip_rel" --repo-type dataset \
+      --local-dir "$RAW_ROOT" || true
   fi
   if [ ! -f "$zip_path" ]; then
-    echo -e "${RED}[FAIL]${NC}  ${task}: 下载后未找到 ${zip_path}"
+    echo -e "${RED}[FAIL]${NC}  ${task}: 下载后未找到 ${zip_path} (检查网络/HF_ENDPOINT/文件是否存在)"
     return 1
   fi
 
@@ -172,7 +172,6 @@ prepare_one() {
   fi
   echo -e "${GREEN}[DONE]${NC}  ${task} -> ${dest}"
 }
-export HF_CLI_BIN="${HF_DL[0]}"
 export -f prepare_one
 export RAW_ROOT SAVE_PATH REPO CONFIG_ZIP COLLECTION_SUFFIX GREEN RED YELLOW NC
 export HF_ENDPOINT HF_CLI_BIN
